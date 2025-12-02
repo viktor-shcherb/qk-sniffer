@@ -17,7 +17,7 @@ SOURCE_DATASET_ID = os.environ.get("SOURCE_DATASET_ID", "HuggingFaceFW/fineweb-e
 SOURCE_CONFIG = os.environ.get("SOURCE_DATASET_CONFIG", "sample-350BT")
 MIN_TOKEN_COUNT = int(os.environ.get("MIN_TOKEN_COUNT", 128 * 1024))
 TARGET_EXAMPLES = int(os.environ.get("TARGET_EXAMPLES", 258))
-PRIVATE = os.environ.get("PRIVATE", "true").lower() == "true"
+PRIVATE = os.environ.get("PRIVATE", "false").lower() == "true"
 
 
 def iter_long_examples(*, limit: int = None) -> Iterable[dict]:
