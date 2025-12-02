@@ -1,0 +1,28 @@
+[project]
+name = "qk-sniffer"
+version = "0.1.0"
+description = "Capture attention key/query vectors and publish them as Hugging Face datasets."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "datasets",
+    "transformers",
+    "pyarrow",
+    "pyyaml",
+    "numpy",
+    "torch",
+    "huggingface_hub",
+    "python-dotenv",
+    "tqdm",
+]
+
+[project.scripts]
+sniff-qk = "sniff:main"
+
+[build-system]
+requires = ["setuptools>=65"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["models", "sniffer", "saver"]
+py-modules = ["sniff"]

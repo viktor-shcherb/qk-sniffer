@@ -1,0 +1,37 @@
+dataset:
+  path: viktoroo/example-dataset
+  name: null
+  split: train
+  text_column: text
+  id_column: id
+  max_samples: 128
+
+model:
+  name: google/gemma-2-2b
+  revision: main
+  dtype: float16
+  device_map: auto
+  trust_remote_code: false
+
+tokenizer:
+  name: google/gemma-2-2b
+  max_length: 4096
+  padding: longest
+
+inference:
+  batch_size: 2
+  autocast_dtype: float16
+
+capture:
+  capture_queries: true
+  capture_keys: true
+  layers: null
+  heads: null
+  sampler:
+    type: log_uniform
+    base_rate: 1.0
+
+output:
+  data_root: data/sniffed-qk
+  readme_path: README.md
+  hf_repo_id: viktoroo/sniffed-qk
