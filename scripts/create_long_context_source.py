@@ -14,9 +14,9 @@ HF_TOKEN_ENV = "HF_TOKEN"
 
 TARGET_DATASET_ID = os.environ.get("TARGET_DATASET_ID", "viktoroo/fineweb-edu-long-context-sample")
 SOURCE_DATASET_ID = os.environ.get("SOURCE_DATASET_ID", "HuggingFaceFW/fineweb-edu")
-SOURCE_CONFIG = os.environ.get("SOURCE_DATASET_CONFIG", "sample-10BT")
+SOURCE_CONFIG = os.environ.get("SOURCE_DATASET_CONFIG", "sample-350BT")
 MIN_TOKEN_COUNT = int(os.environ.get("MIN_TOKEN_COUNT", 128 * 1024))
-TARGET_EXAMPLES = int(os.environ.get("TARGET_EXAMPLES", 1024))
+TARGET_EXAMPLES = int(os.environ.get("TARGET_EXAMPLES", 258))
 PRIVATE = os.environ.get("PRIVATE", "true").lower() == "true"
 
 

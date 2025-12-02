@@ -28,10 +28,6 @@
    pip install --upgrade pip
    pip install -e .
    ```
-4. Authenticate with the Hugging Face Hub if you plan to push datasets:
-   ```bash
-   huggingface-cli login
-   ```
 
 ### Version pinning & reproducibility
 - The project targets Python 3.9+; develop with your preferred interpreter, but for complete reproducibility the Python version can be found at `.python-version`.
