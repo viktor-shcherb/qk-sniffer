@@ -299,7 +299,6 @@ def push_remote_dataset(settings: OutputSettings) -> None:
             repo_id=settings.hf_repo_id,
             folder_path=settings.data_root,
             repo_type="dataset",
-            commit_message="Update sniffed QK dataset",
         )
     except RepositoryNotFoundError:
         print(f"[sniff] Dataset repo {settings.hf_repo_id} not found; please create it before pushing.")
