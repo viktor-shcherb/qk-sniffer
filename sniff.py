@@ -108,12 +108,18 @@ def parse_args() -> argparse.Namespace:
 def load_config(config_path: Path) -> SniffConfig:
     with config_path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle)
+    capture_raw = dict(raw["capture"])
+    sampler_raw = capture_raw.get("sampler")
+    if isinstance(sampler_raw, dict):
+        capture_raw["sampler"] = SamplerSettings(**sampler_raw)
+    elif sampler_raw is None:
+        capture_raw["sampler"] = SamplerSettings()
     return SniffConfig(
         dataset=DatasetSettings(**raw["dataset"]),
         model=ModelSettings(**raw["model"]),
         tokenizer=TokenizerSettings(**raw["tokenizer"]),
         inference=InferenceSettings(**raw["inference"]),
-        capture=CaptureSettings(**raw["capture"]),
+        capture=CaptureSettings(**capture_raw),
         output=OutputSettings(**raw["output"]),
     )
 
@@ -177,20 +183,34 @@ def batch_iter(dataset: Dataset, settings: DatasetSettings, batch_size: int) -> 
         yield {"texts": texts, "example_ids": ids}
 
 
-def _alias_module(module, target_name: str) -> None:
+def _alias_module(module, target_name: str, replace_existing: bool) -> None:
     """
     Register the module under a new name while keeping parent attributes in sync.
     """
+    if target_name in sys.modules and not replace_existing:
+        return
     sys.modules[target_name] = module
     if "." not in target_name:
         return
     parent_name, attr_name = target_name.rsplit(".", 1)
     parent = sys.modules.get(parent_name)
     if parent is None:
-        parent = ModuleType(parent_name)
-        parent.__path__ = []
-        sys.modules[parent_name] = parent
-    setattr(parent, attr_name, module)
+        try:
+            parent = importlib.import_module(parent_name)
+        except ImportError:
+            parent = ModuleType(parent_name)
+            parent.__path__ = []
+            sys.modules[parent_name] = parent
+    if replace_existing or not hasattr(parent, attr_name):
+        setattr(parent, attr_name, module)
+
+
+def _module_exists(name: str) -> bool:
+    try:
+        importlib.import_module(name)
+    except ImportError:
+        return False
+    return True
 
 
 def patch_modeling_modules(root: Path = Path("models")) -> None:
@@ -208,9 +228,14 @@ def patch_modeling_modules(root: Path = Path("models")) -> None:
             rel_parts = file_path.relative_to(root).with_suffix("").parts
             if not rel_parts:
                 continue
-            if rel_parts[-1] == "__init__":
+            is_package = rel_parts[-1] == "__init__"
+            if is_package:
                 rel_parts = rel_parts[:-1]
                 if not rel_parts:
+                    continue
+                target_package = ".".join(["transformers", "models", *rel_parts])
+                if _module_exists(target_package):
+                    # Avoid clobbering upstream packages (e.g., transformers.models.llama).
                     continue
             for depth in range(1, len(rel_parts) + 1):
                 local_name = ".".join(["models", *rel_parts[:depth]])
@@ -220,7 +245,8 @@ def patch_modeling_modules(root: Path = Path("models")) -> None:
                 except ImportError:
                     # If a local module fails to import, bail on deeper descendants.
                     break
-                _alias_module(module, target_name)
+            replace = depth == len(rel_parts)
+            _alias_module(module, target_name, replace_existing=replace)
     finally:
         try:
             sys.path.remove(import_root)

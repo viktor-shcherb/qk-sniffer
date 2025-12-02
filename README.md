@@ -1,3 +1,121 @@
+---
+configs:
+- config_name: all
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/*/*.parquet
+  default: true
+- config_name: layer00
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h*/*.parquet
+- config_name: l00h00
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h00*/*.parquet
+- config_name: l00h01
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h01*/*.parquet
+- config_name: l00h02
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h02*/*.parquet
+- config_name: l00h03
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h03*/*.parquet
+- config_name: l00h04
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h04*/*.parquet
+- config_name: l00h05
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h05*/*.parquet
+- config_name: l00h06
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h06*/*.parquet
+- config_name: l00h07
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h07*/*.parquet
+- config_name: l00h08
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h08*/*.parquet
+- config_name: all_q
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/*q/*.parquet
+- config_name: layer00_q
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h*q/*.parquet
+- config_name: l00h00q
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h00q/*.parquet
+- config_name: l00h01q
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h01q/*.parquet
+- config_name: l00h02q
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h02q/*.parquet
+- config_name: l00h03q
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h03q/*.parquet
+- config_name: l00h04q
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h04q/*.parquet
+- config_name: l00h05q
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h05q/*.parquet
+- config_name: l00h06q
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h06q/*.parquet
+- config_name: l00h07q
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h07q/*.parquet
+- config_name: l00h08q
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h08q/*.parquet
+- config_name: all_k
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/*k/*.parquet
+- config_name: layer00_k
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h*k/*.parquet
+- config_name: l00h00k
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h00k/*.parquet
+- config_name: l00h01k
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h01k/*.parquet
+- config_name: l00h02k
+  data_files:
+  - split: HuggingFaceTB_SmolLM2_135M
+    path: data/sniffed-qk/HuggingFaceTB_SmolLM2_135M/l00h02k/*.parquet
+models:
+- name: HuggingFaceTB/SmolLM2-135M
+  url: https://huggingface.co/HuggingFaceTB/SmolLM2-135M
+- name: none
+  url: https://huggingface.co/none
+---
+
 # qk-sniffer
 
 `qk-sniffer` instruments Hugging Face transformer models so every attention layer can stream sampled key/query vectors into a structured dataset. It ships with ready-made patches for Gemma 3 and Llama families, a deterministic sampler, and a CLI that syncs results to the Hugging Face Hub.
@@ -194,3 +312,36 @@ Remember that split names are sanitized (`/` and `-` become `_`). Inspect `ds_bu
 - When pushing to the Hub, the CLI overwrites the dataset repo contents. Use a scratch repo or branch if you want to keep older captures.
 
 That’s it—create your config, run `sniff-qk`, and explore the captured attention vectors directly from Hugging Face datasets.
+
+## Available Models
+<!-- MODELS_START -->
+- [HuggingFaceTB/SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M)
+  - dataset: viktoroo/longbench2-128k-plus (split: train)
+  - buckets: b0=48, b1=46, b2=42, b3=51, b4=49, b5=38, b6=50, b7=45, b8=38, b9=35, b10=50, b11=46, b12=60
+- [none](https://huggingface.co/none)
+  - dataset: unknown (split: unknown)
+  - buckets: (no samples)
+<!-- MODELS_END -->
+
+## Dataset Columns
+<!-- COLUMNS_START -->
+| Column | Description |
+| --- | --- |
+| `bucket` | Log2 bucket identifier used for sampling (lower buckets capture earlier positions). |
+| `example_id` | Index of the example within the batch when the vector was captured. |
+| `position` | Token position within the example's sequence (0-indexed). |
+| `vector` | Float32 tensor containing the query or key vector; the config name encodes which. |
+| `sliding_window` | Size of the sliding window for local attention (null implies global causal). |
+<!-- COLUMNS_END -->
+
+## Loading Examples
+<!-- LOAD_START -->
+1. Pick the configuration matching your target layer/head and vector type. For example, `l00h00q` captures queries from layer 0, head 0.
+2. Use the source model identifier as the split. Splits follow the Hugging Face hub naming pattern (`org/name`).
+3. Load the dataset via `datasets.load_dataset` with both the config and split:
+```python
+from datasets import load_dataset
+ds = load_dataset("viktoroo/sniffed-qk", "l00h00q", split="org/name")
+```
+4. Convert to torch/tensorflow as needed; the `vector` column already stores float32 tensors.
+<!-- LOAD_END -->

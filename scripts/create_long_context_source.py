@@ -1,59 +1,70 @@
 #!/usr/bin/env python
-"""Build viktoroo/fineweb-edu-long-context-sample from the FineWeb-Edu sample."""
+"""
+Prepare LongBench-v2 long-context subset and upload to Hugging Face.
 
-from __future__ import annotations
+Steps:
+1. Load env vars from .env (expects HF_TOKEN at least).
+2. Download zai-org/LongBench-v2.
+3. Keep only examples with length == "long".
+4. Convert to dataset with columns: id, text (text = context).
+5. Push to viktoroo/longbench2-128k-plus.
+
+Requirements:
+    pip install datasets huggingface_hub python-dotenv
+"""
 
 import os
-from typing import Iterable
 
-from datasets import Dataset, load_dataset
 from dotenv import load_dotenv
-from tqdm.auto import tqdm
+from datasets import load_dataset
 
-HF_TOKEN_ENV = "HF_TOKEN"
-
-TARGET_DATASET_ID = os.environ.get("TARGET_DATASET_ID", "viktoroo/fineweb-edu-long-context-sample")
-SOURCE_DATASET_ID = os.environ.get("SOURCE_DATASET_ID", "HuggingFaceFW/fineweb-edu")
-SOURCE_CONFIG = os.environ.get("SOURCE_DATASET_CONFIG", "sample-350BT")
-MIN_TOKEN_COUNT = int(os.environ.get("MIN_TOKEN_COUNT", 128 * 1024))
-TARGET_EXAMPLES = int(os.environ.get("TARGET_EXAMPLES", 258))
-PRIVATE = os.environ.get("PRIVATE", "false").lower() == "true"
+SOURCE_DATASET_ID = "zai-org/LongBench-v2"
+TARGET_REPO_ID = "viktoroo/longbench2-128k-plus"
 
 
-def iter_long_examples(*, limit: int = None) -> Iterable[dict]:
-    stream = load_dataset(SOURCE_DATASET_ID, SOURCE_CONFIG, split="train", streaming=True)
-    total = 0
-    for example in stream:
-        if example.get("token_count", 0) >= MIN_TOKEN_COUNT:
-            yield example
-            total += 1
-
-        if total >= limit:
-            break
-
-
-def main() -> None:
+def main():
+    # 1. Load env vars from .env
     load_dotenv()
-    hf_token = os.environ.get(HF_TOKEN_ENV)
-    if not hf_token:
-        raise RuntimeError(f"Set {HF_TOKEN_ENV} in your .env before running this script.")
-    examples = []
-    for example in tqdm(
-            iter_long_examples(limit=TARGET_EXAMPLES),
-            total=TARGET_EXAMPLES,
-            desc="Collecting long contexts",
-            unit="example"
-    ):
-        examples.append(example)
 
-    if len(examples) < TARGET_EXAMPLES:
+    hf_token = os.getenv("HF_TOKEN")
+    if not hf_token:
         raise RuntimeError(
-            f"Only gathered {len(examples)} examples with token_count >= {MIN_TOKEN_COUNT}. "
-            "Consider lowering MIN_TOKEN_COUNT or decreasing the sample size."
+            "HF_TOKEN is not set. Put your token in a .env file as HF_TOKEN=..."
         )
-    dataset = Dataset.from_list(examples)
-    dataset.push_to_hub(TARGET_DATASET_ID, token=hf_token, private=PRIVATE)
-    print(f"Uploaded {len(dataset)} rows to {TARGET_DATASET_ID} from {SOURCE_DATASET_ID}:{SOURCE_CONFIG}")
+
+    # 2. Download dataset
+    # The repo has a single split: train (503 rows). :contentReference[oaicite:0]{index=0}
+    print(f"Loading dataset: {SOURCE_DATASET_ID}")
+    ds = load_dataset(SOURCE_DATASET_ID, split="train", token=hf_token)
+
+    print(f"Total rows before filtering: {len(ds)}")
+
+    # 3. Keep only 'long' examples (length field is 'short'/'medium'/'long'). :contentReference[oaicite:1]{index=1}
+    ds_long = ds.filter(lambda ex: ex["length"] == "long")
+    print(f"Rows with length == 'long': {len(ds_long)}")
+
+    # 4. Map to {id, text}, where:
+    #    id   = original _id
+    #    text = original context (the long document). :contentReference[oaicite:2]{index=2}
+    def to_id_text(ex):
+        return {
+            "id": ex["_id"],
+            "text": ex["context"],
+        }
+
+    ds_id_text = ds_long.map(
+        to_id_text,
+        remove_columns=ds_long.column_names,  # keep only id + text
+    )
+
+    # 5. Push to Hugging Face Hub
+    print(f"Pushing to Hub: {TARGET_REPO_ID}")
+    ds_id_text.push_to_hub(
+        repo_id=TARGET_REPO_ID,
+        token=hf_token,
+    )
+
+    print("Done.")
 
 
 if __name__ == "__main__":
