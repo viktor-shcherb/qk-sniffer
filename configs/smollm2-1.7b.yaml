@@ -28,7 +28,7 @@ capture:
   heads: null
   sampler:
     type: log_uniform
-    base_rate: 1.0
+    base_rate: 3.0
 
 output:
   data_root: data/sniffed-qk

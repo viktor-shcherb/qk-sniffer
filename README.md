@@ -216,7 +216,7 @@ output:
 - `tokenizer.*` applies to `AutoTokenizer`. If you omit `name`, it falls back to `model.name`.
 - `inference.batch_size` controls the streaming iterator size; `autocast_dtype` only matters when CUDA is available.
 - `capture.*` toggles which vectors flow to disk. `layers`/`heads` accept Python-style integer lists; pass nothing to capture every head. `sampler.type` currently supports `log_uniform` (custom samplers are pluggable; see below). The dataset split name always mirrors `model.name`.
-- `output.data_root`/`readme_path` define where Parquet shards and the generated README live locally. Set `hf_repo_id` to enable pull/push.
+- `output.data_root`/`readme_path` define where Parquet shards and the generated README live locally. If `readme_path` is relative it’s resolved inside `data_root`, so the README travels with the folder when uploading to the Hub. Set `hf_repo_id` to enable pull/push.
 
 All bundled configs target the shared Hugging Face dataset `viktoroo/sniffed-qk`. Every run pulls the latest snapshot, writes new splits under sanitised model names, and pushes the combined folder so multiple checkpoints can coexist in one dataset.
 

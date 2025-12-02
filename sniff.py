@@ -124,6 +124,14 @@ def load_config(config_path: Path) -> SniffConfig:
     )
 
 
+def resolve_readme_path(settings: OutputSettings) -> Path:
+    readme_raw = settings.readme_path or "README.md"
+    readme_path = Path(readme_raw)
+    if readme_path.is_absolute():
+        return readme_path
+    return Path(settings.data_root) / readme_path
+
+
 def load_hf_dataset(settings: DatasetSettings) -> Dataset:
     dataset = load_dataset(settings.path, settings.name, split=settings.split)
     if settings.max_samples is not None:
@@ -262,8 +270,7 @@ def pull_remote_dataset(settings: OutputSettings) -> None:
             repo_id=settings.hf_repo_id,
             repo_type="dataset",
             local_dir=settings.data_root,
-            local_dir_use_symlinks=False,
-            resume_download=True,
+            force_download=True,
         )
     except RepositoryNotFoundError:
         print(f"[sniff] Dataset repo {settings.hf_repo_id} not found; skipping pull.")
@@ -281,7 +288,7 @@ def push_remote_dataset(settings: OutputSettings) -> None:
         print(f"[sniff] Creating dataset repo {settings.hf_repo_id}")
         api.create_repo(settings.hf_repo_id, repo_type="dataset", exist_ok=True, private=settings.private)
     try:
-        api.upload_folder(
+        api.upload_large_folder(
             repo_id=settings.hf_repo_id,
             folder_path=settings.data_root,
             repo_type="dataset",
@@ -313,7 +320,7 @@ def run_inference(config: SniffConfig) -> None:
     sniffer_config = SnifferConfig(
         model_name=config.model.name,
         data_root=config.output.data_root,
-        readme_path=config.output.readme_path,
+        readme_path=resolve_readme_path(config.output),
         capture_queries=config.capture.capture_queries,
         capture_keys=config.capture.capture_keys,
         layers=set(config.capture.layers) if config.capture.layers else None,
