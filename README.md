@@ -213,7 +213,7 @@ output:
 **Field summary**
 - `dataset.*` drives `datasets.load_dataset`. `max_samples` trims the split locally if you just want a quick smoke test.
 - `model.*` feeds `AutoModelForCausalLM.from_pretrained`. `dtype` goes through `resolve_dtype`, and `device_map="auto"` enables multi-GPU sharding.
-- `tokenizer.*` applies to `AutoTokenizer`. If you omit `name`, it falls back to `model.name`.
+- `tokenizer.*` applies to `AutoTokenizer`. If you omit `name`, it falls back to `model.name`. The CLI forces `padding_side="right"` so padded tokens always sit at the end of the sequence and can be ignored safely.
 - `inference.batch_size` controls the streaming iterator size; `autocast_dtype` only matters when CUDA is available.
 - `capture.*` toggles which vectors flow to disk. `layers`/`heads` accept Python-style integer lists; pass nothing to capture every head. `sampler.type` currently supports `log_uniform` (custom samplers are pluggable; see below). The dataset split name always mirrors `model.name`.
 - `output.data_root`/`readme_path` define where Parquet shards and the generated README live locally. If `readme_path` is relative it’s resolved inside `data_root`, so the README travels with the folder when uploading to the Hub. Set `hf_repo_id` to enable pull/push.
@@ -256,6 +256,7 @@ All bundled configs target the shared Hugging Face dataset `viktoroo/sniffed-qk`
       )
   ```
 - Use `set_active_example_ids([...])` inside your dataloader loop to ensure captures store the true IDs. If you skip it, the runtime defaults to `[0, 1, …]` per batch.
+- Call `set_active_sequence_lengths([...])` (the CLI does this automatically) to provide the valid token counts for the current batch, ensuring padded positions are never captured regardless of batch padding length.
 
 ### Sniffer runtime & sampling
 - `activate_sniffer(SnifferConfig)` opens a context manager around the capture session. `run_inference` does this once at startup, so all instrumentation simply grabs `get_active_sniffer()`.

@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Optional, Sequence, Set, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -31,6 +31,7 @@ class Sniffer:
         self.saver = DatasetSaver(root=config.data_root, readme_path=config.readme_path)
         self.saver.register_model_metadata(self.config.model_name, self.config.metadata)
         self._example_ids: Optional[Sequence[int]] = None
+        self._sequence_lengths: Optional[List[int]] = None
         self.sampler: Sampler = (
             config.sampler_factory()
             if config.sampler_factory is not None
@@ -94,6 +95,10 @@ class Sniffer:
 
     def set_example_ids(self, example_ids: Sequence[int]) -> None:
         self._example_ids = list(example_ids)
+        self._sequence_lengths = None
+
+    def set_sequence_lengths(self, sequence_lengths: Sequence[int]) -> None:
+        self._sequence_lengths = [max(0, int(length)) for length in sequence_lengths]
 
     def _rows_from_tensor(
         self,
@@ -112,6 +117,12 @@ class Sniffer:
         bucket_cpu = buckets.detach().to("cpu").numpy()
 
         batch_size, num_heads, seq_len, head_dim = tensor_cpu.shape
+        sequence_lengths = self._sequence_lengths
+        if sequence_lengths is not None and len(sequence_lengths) != batch_size:
+            raise ValueError(
+                f"Expected {batch_size} sequence lengths, got {len(sequence_lengths)}. "
+                "Call set_active_sequence_lengths with values for each batch item."
+            )
         rows: list[CaptureRow] = []
         for head_idx in range(num_heads):
             if heads_filter is not None and head_idx not in heads_filter:
@@ -120,6 +131,9 @@ class Sniffer:
                 example_id = int(example_cpu[batch_idx, 0])
                 pos_slice = position_cpu[batch_idx]
                 bucket_slice = bucket_cpu[batch_idx]
+                valid_length = (
+                    seq_len if sequence_lengths is None else min(seq_len, max(0, sequence_lengths[batch_idx]))
+                )
                 mask = self.sampler.sample_positions(
                     layer_idx=layer_idx,
                     head_idx=head_idx,
@@ -132,6 +146,8 @@ class Sniffer:
                     continue
                 vectors = tensor_cpu[batch_idx, head_idx]
                 for pos_idx, keep in enumerate(mask):
+                    if pos_idx >= valid_length:
+                        break
                     if not keep:
                         continue
                     rows.append(
@@ -174,6 +190,13 @@ def set_active_example_ids(example_ids: Sequence[int]) -> None:
     if sniffer is None:
         raise RuntimeError("No active sniffer session to attach example ids.")
     sniffer.set_example_ids(example_ids)
+
+
+def set_active_sequence_lengths(sequence_lengths: Sequence[int]) -> None:
+    sniffer = get_active_sniffer()
+    if sniffer is None:
+        raise RuntimeError("No active sniffer session to attach sequence lengths.")
+    sniffer.set_sequence_lengths(sequence_lengths)
 
 
 @contextmanager

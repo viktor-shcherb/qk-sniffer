@@ -4,6 +4,7 @@ from .core import (
     activate_sniffer,
     get_active_sniffer,
     set_active_example_ids,
+    set_active_sequence_lengths,
     use_sniffer,
 )
 from .samplers import LogUniformSampler, Sampler
@@ -16,6 +17,7 @@ __all__ = [
     "use_sniffer",
     "get_active_sniffer",
     "set_active_example_ids",
+    "set_active_sequence_lengths",
     "Sampler",
     "LogUniformSampler",
     "compute_positions",

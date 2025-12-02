@@ -19,7 +19,13 @@ from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.errors import RepositoryNotFoundError, HfHubHTTPError
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from sniffer import LogUniformSampler, SnifferConfig, activate_sniffer, set_active_example_ids
+from sniffer import (
+    LogUniformSampler,
+    SnifferConfig,
+    activate_sniffer,
+    set_active_example_ids,
+    set_active_sequence_lengths,
+)
 
 load_dotenv()
 
@@ -144,6 +150,7 @@ def prepare_tokenizer(settings: TokenizerSettings, model_name: str):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
+    tokenizer.padding_side = "right"
     return tokenizer
 
 
@@ -351,7 +358,15 @@ def run_inference(config: SniffConfig) -> None:
                     truncation=True,
                     max_length=config.tokenizer.max_length,
                 )
-                set_active_example_ids(batch["example_ids"])
+                batch_example_ids = batch["example_ids"]
+                attention_mask = encodings.get("attention_mask")
+                if attention_mask is not None:
+                    valid_lengths = attention_mask.sum(dim=1).tolist()
+                else:
+                    seq_len = next(iter(encodings.values())).shape[-1]
+                    valid_lengths = [seq_len] * len(texts)
+                set_active_example_ids(batch_example_ids)
+                set_active_sequence_lengths([int(length) for length in valid_lengths])
                 inputs = {k: v.to(primary_device) for k, v in encodings.items()}
                 with torch.no_grad():
                     use_autocast = primary_device.type == "cuda"

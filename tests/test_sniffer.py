@@ -18,6 +18,7 @@ from sniffer import (
     compute_positions,
     get_active_sniffer,
     set_active_example_ids,
+    set_active_sequence_lengths,
 )
 
 
@@ -123,6 +124,27 @@ def test_sniffer_custom_example_ids(tmp_path):
     assert table.column("example_id").to_pylist() == [42]
 
 
+def test_sniffer_respects_sequence_lengths(tmp_path):
+    config = SnifferConfig(
+        model_name="meta/llama3-8b",
+        data_root=tmp_path / "data",
+        readme_path=tmp_path / "README.md",
+        sampler_factory=lambda: AlwaysSampler(),
+    )
+    sniffer = Sniffer(config)
+    sniffer.set_sequence_lengths([2])
+
+    states = torch.randn(1, 1, 4, 4)
+    positions = compute_positions(batch_size=1, seq_len=4, device=states.device, cache_position=None)
+    sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
+    sniffer.close()
+
+    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    table = pq.read_table(q_path)
+    assert table.num_rows == 2
+    assert table.column("position").to_pylist() == [0, 1]
+
+
 def test_sniffer_respects_layer_and_head_filters(tmp_path):
     config = SnifferConfig(
         model_name="meta/llama3-8b",
@@ -198,6 +220,23 @@ def test_set_active_example_ids_updates_current_session(tmp_path):
     q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
     table = pq.read_table(q_path)
     assert table.column("example_id").to_pylist() == [99]
+
+
+def test_set_active_sequence_lengths_updates_current_session(tmp_path):
+    config = SnifferConfig(
+        model_name="meta/llama3-8b",
+        data_root=tmp_path / "data",
+        readme_path=tmp_path / "README.md",
+        sampler_factory=lambda: AlwaysSampler(),
+    )
+    with activate_sniffer(config) as sniffer:
+        set_active_sequence_lengths([1])
+        states = torch.ones(1, 1, 3, 4)
+        positions = compute_positions(batch_size=1, seq_len=3, device=states.device, cache_position=None)
+        sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
+    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    table = pq.read_table(q_path)
+    assert table.column("position").to_pylist() == [0]
 
 
 def test_custom_sampler_drops_non_zero_buckets(tmp_path):
