@@ -303,7 +303,7 @@ def run_inference(config: SniffConfig) -> None:
     model = AutoModelForCausalLM.from_pretrained(
         config.model.name,
         revision=config.model.revision,
-        torch_dtype=torch_dtype,
+        dtype=torch_dtype,
         device_map=config.model.device_map,
         trust_remote_code=config.model.trust_remote_code,
     )
@@ -328,6 +328,7 @@ def run_inference(config: SniffConfig) -> None:
 
     primary_device = resolve_primary_device(model)
     autocast_dtype = resolve_dtype(config.inference.autocast_dtype)
+    print("Model device:", primary_device)
 
     progress = tqdm(total=len(dataset), desc="Capturing", unit="rows")
     try:
