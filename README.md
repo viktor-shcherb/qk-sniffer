@@ -4,7 +4,7 @@
 
 ## Highlights
 - **Zero-touch model overrides** – drop a mirrored module under `models/<name>/modeling_<name>.py` and `patch_modeling_modules()` automatically registers it under `transformers.models.*` before any model loads.
-- **Deterministic sampling & metadata** – `LogUniformSampler` keeps attention load manageable by sampling positions per bucket with a reproducible RNG seeded by `(example, layer, head, kind)`. `set_active_example_ids()` lets you persist real document IDs instead of batch indexes.
+- **Deterministic sampling & metadata** – `LogUniformSampler` keeps attention load manageable by sampling positions per bucket with a reproducible RNG seeded by `(example, layer, head, kind)`.
 - **Structured storage with README automation** – `DatasetSaver` writes Parquet shards under sanitized split/config folders, deduplicates `(example_id, position)` pairs, and rewrites the dataset README so `datasets.load_dataset` immediately works against the folder or Hub repo.
 - **Turn-key CLI** – `sniff.py` (exported as `sniff-qk`) loads configs from YAML, pulls a Hub dataset snapshot, runs inference with your model/tokenizer choices, captures vectors, and optionally pushes the updated dataset back to the Hub.
 
@@ -35,9 +35,6 @@
 
 ### Environment variables
 - Create a `.env` file at the repo root and set `HF_TOKEN=<your Hugging Face token>` (plus any overrides such as `TARGET_DATASET_ID`). Both the CLI and utility scripts call `python-dotenv` automatically, so the values are available without exporting them in your shell.
-
-### Building the long-context source dataset
-- Run `python scripts/create_long_context_source.py` to materialize `viktoroo/fineweb-edu-long-context-sample`. The script streams the `HuggingFaceFW/fineweb-edu` dataset (config `sample-10BT`), selects the first 1,024 rows whose `token_count` is at least 128,000 tokens, and pushes the result to the target dataset (defaults can be overridden via environment variables).
 
 ## Running a Capture
 1. **Ensure instrumentation exists.** Out of the box Gemma 3 and Llama modules live under `models/` with sniffer hooks. To extend another model, copy its `transformers` implementation into `models/<name>/modeling_<name>.py` and add the `get_active_sniffer()` logic described below.
@@ -195,36 +192,3 @@ Remember that split names are sanitized (`/` and `-` become `_`). Inspect `ds_bu
 - When pushing to the Hub, the CLI overwrites the dataset repo contents. Use a scratch repo or branch if you want to keep older captures.
 
 That’s it—create your config, run `sniff-qk`, and explore the captured attention vectors directly from Hugging Face datasets.
-
-## Available Models
-<!-- MODELS_START -->
-- [HuggingFaceTB/SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M)
-  - dataset: viktoroo/longbench2-128k-plus (split: train)
-  - buckets: b0=48, b1=46, b2=42, b3=51, b4=49, b5=38, b6=50, b7=45, b8=38, b9=35, b10=50, b11=46, b12=60
-- [none](https://huggingface.co/none)
-  - dataset: unknown (split: unknown)
-  - buckets: (no samples)
-<!-- MODELS_END -->
-
-## Dataset Columns
-<!-- COLUMNS_START -->
-| Column | Description |
-| --- | --- |
-| `bucket` | Log2 bucket identifier used for sampling (lower buckets capture earlier positions). |
-| `example_id` | Index of the example within the batch when the vector was captured. |
-| `position` | Token position within the example's sequence (0-indexed). |
-| `vector` | Float32 tensor containing the query or key vector; the config name encodes which. |
-| `sliding_window` | Size of the sliding window for local attention (null implies global causal). |
-<!-- COLUMNS_END -->
-
-## Loading Examples
-<!-- LOAD_START -->
-1. Pick the configuration matching your target layer/head and vector type. For example, `l00h00q` captures queries from layer 0, head 0.
-2. Use the source model identifier as the split. Splits follow the Hugging Face hub naming pattern (`org/name`).
-3. Load the dataset via `datasets.load_dataset` with both the config and split:
-```python
-from datasets import load_dataset
-ds = load_dataset("viktoroo/sniffed-qk", "l00h00q", split="org/name")
-```
-4. Convert to torch/tensorflow as needed; the `vector` column already stores float32 tensors.
-<!-- LOAD_END -->

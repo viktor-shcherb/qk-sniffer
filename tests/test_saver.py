@@ -117,6 +117,28 @@ def test_dataset_saver_includes_model_stats_in_readme(tmp_path):
     assert "b2=1" in readme
 
 
+def test_dataset_saver_preserves_model_stats_across_runs(tmp_path):
+    root = tmp_path / "data"
+    readme = tmp_path / "README.md"
+
+    first = DatasetSaver(root=root, readme_path=readme)
+    first.register_model_metadata(
+        "meta/llama3-8b",
+        {"source_dataset": "dummy/dataset", "dataset_split": "train"},
+    )
+    first.add(_row("meta/llama3-8b", layer=0, head=0, kind="q", bucket=2, example_id=0, position=0, vector=[0.1]))
+    first.close()
+
+    second = DatasetSaver(root=root, readme_path=readme)
+    second.register_model_metadata("google/gemma3-9b", {"source_dataset": "other/dataset", "dataset_split": "train"})
+    second.add(_row("google/gemma3-9b", layer=1, head=1, kind="k", bucket=5, example_id=1, position=3, vector=[0.5]))
+    second.close()
+
+    readme_text = readme.read_text()
+    assert "dummy/dataset" in readme_text, "metadata from the first run should remain"
+    assert "b2=1" in readme_text, "bucket counts from the first run should remain"
+
+
 def test_readme_preserves_custom_fields_and_description(tmp_path):
     readme_path = tmp_path / "README.md"
     readme_path.write_text(

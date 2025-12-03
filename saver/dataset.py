@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -143,6 +144,8 @@ class DatasetSaver:
         self._readme = DatasetReadme(readme_path, self.root, dataset_name)
         self._write_batch_size = max(1, int(write_batch_size))
         self._pending: Dict[Tuple[str, str], Dict[str, List]] = {}
+        self._state_path = self.root / "_saver_state.json"
+        self._load_state()
         self._seed_existing_entries()
 
     def add(self, row: CaptureRow) -> None:
@@ -261,6 +264,7 @@ class DatasetSaver:
         self._sinks.clear()
         self._pending.clear()
         self._write_readme()
+        self._save_state()
 
     def __enter__(self) -> "DatasetSaver":
         return self
@@ -271,6 +275,7 @@ class DatasetSaver:
     def register_model_metadata(self, model_name: str, metadata: Dict[str, Union[str, int, float]]) -> None:
         sanitized = self._sanitized_splits.setdefault(model_name, _sanitize_split(model_name))
         self._model_metadata.setdefault(model_name, {}).update(metadata)
+        self._models.add(model_name)
         (self.root / sanitized).mkdir(parents=True, exist_ok=True)
 
     def _write_readme(self) -> None:
@@ -313,6 +318,52 @@ class DatasetSaver:
         for example_id, position in zip(example_ids, positions):
             cache.add((int(example_id), int(position)))
         return cache
+
+    def _load_state(self) -> None:
+        if not self._state_path.exists():
+            return
+        try:
+            data = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+
+        metadata = data.get("model_metadata", {})
+        if isinstance(metadata, dict):
+            for model_name, meta in metadata.items():
+                if isinstance(meta, dict):
+                    self._model_metadata.setdefault(model_name, {}).update(meta)
+                    self._models.add(model_name)
+
+        bucket_counts = data.get("bucket_counts", {})
+        if isinstance(bucket_counts, dict):
+            for model_name, counts in bucket_counts.items():
+                if not isinstance(counts, dict):
+                    continue
+                counter = Counter()
+                for bucket_key, value in counts.items():
+                    try:
+                        bucket_idx = int(bucket_key)
+                        counter[bucket_idx] = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                if counter:
+                    self._bucket_counts[model_name].update(counter)
+                    self._models.add(model_name)
+
+    def _save_state(self) -> None:
+        bucket_counts = {
+            model: {str(bucket): int(count) for bucket, count in counts.items()}
+            for model, counts in self._bucket_counts.items()
+            if counts
+        }
+        state = {
+            "model_metadata": self._model_metadata,
+            "bucket_counts": bucket_counts,
+        }
+        try:
+            self._state_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+        except Exception:
+            pass
 
 
 def _to_numpy(vector: Union["np.ndarray", "torch.Tensor", Sequence[float]]) -> "np.ndarray":

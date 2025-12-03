@@ -5,6 +5,7 @@ description = "Capture attention key/query vectors and publish them as Hugging F
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
+    "accelerate",
     "datasets",
     "transformers",
     "pyarrow",
