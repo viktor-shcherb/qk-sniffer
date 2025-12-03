@@ -56,6 +56,23 @@ class CaptureRow:
         return f"l{self.layer_idx:02d}h{self.head_idx:02d}{self.vector_kind}"
 
 
+@dataclass(slots=True)
+class CaptureBatch:
+    model_name: str
+    layer_idx: int
+    head_idx: int
+    vector_kind: VectorKind
+    buckets: "np.ndarray"
+    example_ids: "np.ndarray"
+    positions: "np.ndarray"
+    vectors: "np.ndarray"
+    sliding_window: Optional[int]
+
+    @property
+    def config_name(self) -> str:
+        return f"l{self.layer_idx:02d}h{self.head_idx:02d}{self.vector_kind}"
+
+
 class _ParquetSink:
     """Keeps a Parquet writer open for a split/config pair."""
 
@@ -110,6 +127,7 @@ class DatasetSaver:
         compression: str = "zstd",
         readme_path: Union[str, Path] = "README.md",
         dataset_name: str = "viktoroo/sniffed-qk",
+        write_batch_size: int = 2048,
     ):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -123,68 +141,125 @@ class DatasetSaver:
         self._model_metadata: Dict[str, Dict[str, Union[str, int, float]]] = {}
         self._bucket_counts: Dict[str, Counter] = defaultdict(Counter)
         self._readme = DatasetReadme(readme_path, self.root, dataset_name)
+        self._write_batch_size = max(1, int(write_batch_size))
+        self._pending: Dict[Tuple[str, str], Dict[str, List]] = {}
         self._seed_existing_entries()
 
     def add(self, row: CaptureRow) -> None:
         self.add_many([row])
 
     def add_many(self, rows: Iterable[CaptureRow]) -> None:
-        batch_by_sink: Dict[Tuple[str, str], Dict[str, list]] = {}
-
+        if np is None:
+            raise RuntimeError("NumPy is required to convert vectors for storage.")
         for row in rows:
-            split = row.model_name
-            storage_split = self._sanitized_splits.setdefault(split, _sanitize_split(split))
-            config = row.config_name
-            key = (storage_split, config)
-            if key not in batch_by_sink:
-                position_cache = self._position_cache.setdefault(key, self._load_existing_positions(storage_split, config))
-                batch_by_sink[key] = {
-                    "bucket": [],
-                    "example_id": [],
-                    "position": [],
-                    "vector": [],
-                    "sliding_window": [],
-                    "position_cache": position_cache,
-                }
-
-            batch = batch_by_sink[key]
-            position_cache: Set[Tuple[int, int]] = batch["position_cache"]
-            position_key = (row.example_id, row.position)
-            if position_key in position_cache:
-                continue
-            position_cache.add(position_key)
-            batch["bucket"].append(row.bucket)
-            batch["example_id"].append(row.example_id)
-            batch["position"].append(row.position)
-            batch["vector"].append(_to_numpy(row.vector))
-            batch["sliding_window"].append(row.sliding_window)
-            self._models.add(split)
-            self._config_splits.setdefault(config, set()).add(storage_split)
-            self._bucket_counts[row.model_name][row.bucket] += 1
-
-        for (storage_split, config), columns in batch_by_sink.items():
-            columns = dict(columns)
-            columns.pop("position_cache", None)
-            if not columns["vector"]:
-                continue
-            sink = self._sinks.setdefault((storage_split, config), self._create_sink(storage_split, config))
-            vector_array = _vectors_to_fixed_list(columns["vector"])
-            table = pa.table(
-                {
-                    "bucket": pa.array(columns["bucket"], type=pa.int32()),
-                    "example_id": pa.array(columns["example_id"], type=pa.int32()),
-                    "position": pa.array(columns["position"], type=pa.int32()),
-                    "vector": vector_array,
-                    "sliding_window": pa.array(columns["sliding_window"]),
-                }
+            vector = _to_numpy(row.vector)
+            batch = CaptureBatch(
+                model_name=row.model_name,
+                layer_idx=row.layer_idx,
+                head_idx=row.head_idx,
+                vector_kind=row.vector_kind,
+                buckets=np.asarray([row.bucket], dtype=np.int64),
+                example_ids=np.asarray([row.example_id], dtype=np.int64),
+                positions=np.asarray([row.position], dtype=np.int64),
+                vectors=np.asarray([vector], dtype=np.float32),
+                sliding_window=row.sliding_window,
             )
-            sink.write(table)
+            self.add_batch(batch)
+
+    def add_batch(self, batch: CaptureBatch) -> None:
+        if np is None:
+            raise RuntimeError("NumPy is required to convert vectors for storage.")
+        buckets = np.asarray(batch.buckets, dtype=np.int64).reshape(-1)
+        example_ids = np.asarray(batch.example_ids, dtype=np.int64).reshape(-1)
+        positions = np.asarray(batch.positions, dtype=np.int64).reshape(-1)
+        vectors = np.asarray(batch.vectors, dtype=np.float32)
+        row_count = buckets.shape[0]
+        if row_count == 0:
+            return
+        if not (example_ids.shape[0] == positions.shape[0] == row_count == vectors.shape[0]):
+            raise ValueError("CaptureBatch columns must share the same length.")
+
+        split = batch.model_name
+        storage_split = self._sanitized_splits.setdefault(split, _sanitize_split(split))
+        config = batch.config_name
+        key = (storage_split, config)
+        position_cache = self._position_cache.setdefault(key, self._load_existing_positions(storage_split, config))
+
+        keep_mask = np.ones(row_count, dtype=bool)
+        for idx in range(row_count):
+            position_key = (int(example_ids[idx]), int(positions[idx]))
+            if position_key in position_cache:
+                keep_mask[idx] = False
+            else:
+                position_cache.add(position_key)
+
+        if not keep_mask.any():
+            return
+
+        buckets = buckets[keep_mask].astype("int32", copy=False)
+        example_ids = example_ids[keep_mask].astype("int32", copy=False)
+        positions = positions[keep_mask].astype("int32", copy=False)
+        vectors = vectors[keep_mask].astype("float32", copy=False)
+        sliding_window_values: List = (
+            [int(batch.sliding_window)] * buckets.shape[0]
+            if batch.sliding_window is not None
+            else [None] * buckets.shape[0]
+        )
+
+        columns = {
+            "bucket": buckets.tolist(),
+            "example_id": example_ids.tolist(),
+            "position": positions.tolist(),
+            "vector": [np.copy(vec) for vec in vectors],
+            "sliding_window": sliding_window_values,
+        }
+
+        self._models.add(split)
+        self._config_splits.setdefault(config, set()).add(storage_split)
+        for bucket in buckets.tolist():
+            self._bucket_counts[split][bucket] += 1
+
+        self._append_pending(key, columns)
+
+    def _append_pending(self, key: Tuple[str, str], columns: Dict[str, List]) -> None:
+        pending = self._pending.setdefault(key, self._empty_pending())
+        for name, values in columns.items():
+            pending[name].extend(values)
+        if len(pending["vector"]) >= self._write_batch_size:
+            self._flush_pending(key)
+
+    def _flush_pending(self, key: Tuple[str, str]) -> None:
+        pending = self._pending.get(key)
+        if not pending or not pending["vector"]:
+            return
+        storage_split, config = key
+        sink = self._sinks.setdefault(key, self._create_sink(storage_split, config))
+        vector_array = _vectors_to_fixed_list(pending["vector"])
+        table = pa.table(
+            {
+                "bucket": pa.array(pending["bucket"], type=pa.int32()),
+                "example_id": pa.array(pending["example_id"], type=pa.int32()),
+                "position": pa.array(pending["position"], type=pa.int32()),
+                "vector": vector_array,
+                "sliding_window": pa.array(pending["sliding_window"]),
+            }
+        )
+        sink.write(table)
+        for values in pending.values():
+            values.clear()
+
+    @staticmethod
+    def _empty_pending() -> Dict[str, List]:
+        return {"bucket": [], "example_id": [], "position": [], "vector": [], "sliding_window": []}
 
     def close(self) -> None:
+        for key in list(self._pending.keys()):
+            self._flush_pending(key)
         current_sinks = list(self._sinks.values())
         for sink in current_sinks:
             sink.close()
         self._sinks.clear()
+        self._pending.clear()
         self._write_readme()
 
     def __enter__(self) -> "DatasetSaver":

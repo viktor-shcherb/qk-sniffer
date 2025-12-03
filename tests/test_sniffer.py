@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import numpy as np
 import pyarrow.parquet as pq
 import pytest
 import torch
@@ -24,13 +23,13 @@ from sniffer import (
 
 class AlwaysSampler(Sampler):
     def sample_positions(self, **kwargs):
-        positions = kwargs["positions"]
-        return np.ones_like(positions, dtype=bool)
+        positions: torch.Tensor = kwargs["positions"]
+        return torch.ones_like(positions, dtype=torch.bool)
 
 
 class BucketZeroSampler(Sampler):
     def sample_positions(self, **kwargs):
-        buckets = kwargs["buckets"]
+        buckets: torch.Tensor = kwargs["buckets"]
         return buckets == 0
 
 
@@ -143,6 +142,25 @@ def test_sniffer_respects_sequence_lengths(tmp_path):
     table = pq.read_table(q_path)
     assert table.num_rows == 2
     assert table.column("position").to_pylist() == [0, 1]
+
+
+def test_sniffer_max_rows_per_batch(tmp_path):
+    config = SnifferConfig(
+        model_name="meta/llama3-8b",
+        data_root=tmp_path / "data",
+        readme_path=tmp_path / "README.md",
+        max_rows_per_batch=1,
+        sampler_factory=lambda: AlwaysSampler(),
+    )
+    sniffer = Sniffer(config)
+    states = torch.randn(1, 1, 4, 4)
+    positions = compute_positions(batch_size=1, seq_len=4, device=states.device, cache_position=None)
+    sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
+    sniffer.close()
+
+    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    table = pq.read_table(q_path)
+    assert table.num_rows == 1
 
 
 def test_sniffer_respects_layer_and_head_filters(tmp_path):
@@ -260,13 +278,14 @@ def test_custom_sampler_drops_non_zero_buckets(tmp_path):
 
 def test_log_uniform_sampler_deterministic():
     sampler = LogUniformSampler(base_rate=1.0)
-    buckets = np.array([0, 1, 1, 2])
+    buckets = torch.tensor([0, 1, 1, 2], dtype=torch.int64)
+    positions = torch.arange(4, dtype=torch.int64)
     mask1 = sampler.sample_positions(
         layer_idx=0,
         head_idx=0,
         vector_kind="q",
         example_id=7,
-        positions=np.arange(4),
+        positions=positions,
         buckets=buckets,
     )
     mask2 = sampler.sample_positions(
@@ -274,25 +293,26 @@ def test_log_uniform_sampler_deterministic():
         head_idx=0,
         vector_kind="q",
         example_id=7,
-        positions=np.arange(4),
+        positions=positions,
         buckets=buckets,
     )
-    assert np.array_equal(mask1, mask2)
+    assert torch.equal(mask1, mask2)
 
 
 def test_log_uniform_sampler_bucket_size_scaling():
     sampler = LogUniformSampler(base_rate=4.0)
-    buckets = np.array([0, 1, 1, 2, 2, 2, 2])
+    buckets = torch.tensor([0, 1, 1, 2, 2, 2, 2], dtype=torch.int64)
+    positions = torch.arange(len(buckets), dtype=torch.int64)
     mask = sampler.sample_positions(
         layer_idx=0,
         head_idx=0,
         vector_kind="k",
         example_id=3,
-        positions=np.arange(len(buckets)),
+        positions=positions,
         buckets=buckets,
     )
     # base_rate equals bucket_size up to bucket 2, so every entry kept deterministically
-    assert mask.all()
+    assert mask.all().item()
 
 
 def test_compute_positions_matches_reference():

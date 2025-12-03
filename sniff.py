@@ -43,6 +43,8 @@ class CaptureSettings:
     layers: Optional[List[int]] = None
     heads: Optional[List[int]] = None
     sampler: SamplerSettings = field(default_factory=SamplerSettings)
+    max_rows_per_batch: Optional[int] = None
+    queue_size: int = 8
 
 
 @dataclass
@@ -83,6 +85,7 @@ class OutputSettings:
     readme_path: str = "README.md"
     hf_repo_id: Optional[str] = None
     private: bool = False
+    write_batch_size: int = 2048
 
 
 @dataclass
@@ -295,10 +298,11 @@ def push_remote_dataset(settings: OutputSettings) -> None:
         print(f"[sniff] Creating dataset repo {settings.hf_repo_id}")
         api.create_repo(settings.hf_repo_id, repo_type="dataset", exist_ok=True, private=settings.private)
     try:
-        api.upload_large_folder(
+        api.upload_folder(
             repo_id=settings.hf_repo_id,
             folder_path=settings.data_root,
             repo_type="dataset",
+            commit_message="Update dataset",
         )
     except RepositoryNotFoundError:
         print(f"[sniff] Dataset repo {settings.hf_repo_id} not found; please create it before pushing.")
@@ -332,6 +336,9 @@ def run_inference(config: SniffConfig) -> None:
         layers=set(config.capture.layers) if config.capture.layers else None,
         heads=set(config.capture.heads) if config.capture.heads else None,
         sampler_factory=sampler_factory,
+        max_rows_per_batch=config.capture.max_rows_per_batch,
+        queue_size=config.capture.queue_size,
+        write_batch_size=config.output.write_batch_size,
         metadata={
             "source_dataset": config.dataset.path,
             "dataset_name": config.dataset.name or "",

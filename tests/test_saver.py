@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pyarrow.parquet as pq
 import pytest
 import yaml
 from datasets import load_dataset
 
-from saver.dataset import CaptureRow, DatasetSaver
+from saver.dataset import CaptureBatch, CaptureRow, DatasetSaver
 
 
 def test_dataset_saver_writes_parquet_and_readme(tmp_path):
@@ -80,6 +81,29 @@ def test_dataset_saver_skips_duplicates_across_sessions(tmp_path):
     parquet_path = root / "meta_llama3_8b" / "l00h00q" / "data.parquet"
     table = pq.read_table(parquet_path)
     assert table.num_rows == 1
+
+
+def test_dataset_saver_add_batch_deduplicates_and_flushes(tmp_path):
+    saver = DatasetSaver(root=tmp_path / "data", readme_path=tmp_path / "README.md", write_batch_size=16)
+    batch = CaptureBatch(
+        model_name="meta/llama3-8b",
+        layer_idx=0,
+        head_idx=0,
+        vector_kind="q",
+        buckets=np.array([0, 0, 1], dtype=np.int64),
+        example_ids=np.array([7, 7, 8], dtype=np.int64),
+        positions=np.array([0, 0, 1], dtype=np.int64),
+        vectors=np.array([[0.1], [0.2], [0.3]], dtype=np.float32),
+        sliding_window=64,
+    )
+    saver.add_batch(batch)
+    saver.close()
+
+    parquet_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    table = pq.read_table(parquet_path)
+    # duplicate (7, 0) dropped
+    assert table.num_rows == 2
+    assert table.column("sliding_window").to_pylist() == [64, 64]
 
 
 def test_dataset_saver_includes_model_stats_in_readme(tmp_path):
