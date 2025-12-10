@@ -26,9 +26,9 @@ capture:
   capture_keys: true
   layers: null
   heads: null
-  min_bucket_size: 128
+  min_bucket_size: 512
   sampler:
-    type: log_uniform
+    type: uniform
     base_rate: 3.0
 
 output:

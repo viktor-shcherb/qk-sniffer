@@ -29,13 +29,13 @@
    inference:
      batch_size: 2
      autocast_dtype: float16
-   capture:
-     capture_queries: true
-     capture_keys: true
-     min_bucket_size: 128
-     sampler:
-       type: log_uniform
-       base_rate: 1.0
+  capture:
+    capture_queries: true
+    capture_keys: true
+    min_bucket_size: 128
+    sampler:
+      type: log_uniform       # or uniform
+      base_rate: 1.0
    output:
      data_root: data/sniffed-qk
      readme_path: README.md
@@ -54,8 +54,8 @@
 - `model.*`/`tokenizer.*` feed `AutoModelForCausalLM` and `AutoTokenizer`. `device_map=auto` works well for multi-GPU.
 - `capture.*`
   - `layers`, `heads` accept Python-style integer lists; omit to capture every head.
-  - `min_bucket_size` is rounded **up** to the next power of two; bucket IDs are the corresponding exponent (`b{i}` refers to `[2^i, 2^{i+1})`). Positions whose exponent is smaller than `ceil(log2(min_bucket_size_rounded))` collapse into that `i`, so the first bucket spans at least the requested width.
-  - `sampler.type=log_uniform` keeps roughly `base_rate` tokens per bucket via a deterministic RNG seeded by `(example, layer, head, kind)`.
+  - `min_bucket_size` drives both bucketing and sampling: `log_uniform` rounds it up to the next power of two and uses it as the minimum `2^i` bucket width (bucket IDs remain the exponent `i`, so `b{i}` → `[2^i, 2^{i+1})`). `uniform` treats it as a fixed chunk size and stores `floor(position / min_bucket_size)`.
+  - `sampler.type` controls the bucket definition automatically: `log_uniform` samples uniformly *within* each log bucket, while `uniform` samples uniformly over every fixed-width bucket. Both are deterministic per `(example, layer, head, kind)`.
 - `output.*`
   - `data_root` is both your working directory and (optionally) the local clone of `hf_repo_id`.
   - `sniff.py` writes staged captures to a temp folder, then re-pulls `hf_repo_id` before merging so concurrent remote updates win.
@@ -68,7 +68,7 @@
 
   | Column | Description |
   | --- | --- |
-  | `bucket` | Base-2 exponent `i`; bucket `b{i}` corresponds to `[2^i, 2^{i+1})`. Values below the minimum exponent collapse so the first bucket covers ≥ `min_bucket_size`. |
+| `bucket` | Identifier of the bucket the token fell into. `log_uniform` stores the exponent `i` (clamped upward so the first bucket spans ≥ `min_bucket_size`), meaning bucket `b{i}` maps to `[2^i, 2^{i+1})`. `uniform` stores `floor(position / min_bucket_size)` so every bucket covers exactly `min_bucket_size` tokens (last bucket may be smaller). |
   | `example_id` | Batch ID from `set_active_example_ids` (or the implicit index). |
   | `position` | Token index after any cache offset. |
   | `vector` | Float32 list representing the captured query/key vector. |

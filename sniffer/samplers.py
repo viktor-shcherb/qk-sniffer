@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import math
+import math
 
 import torch
 
@@ -37,6 +38,7 @@ def _seed(example_id: int, layer_idx: int, head_idx: int, vector_kind: str) -> i
 class LogUniformSampler(Sampler):
     base_rate: float = 1.0
     min_bucket_size: int = 128
+    bucket_kind: str = "log"
 
     def __post_init__(self) -> None:
         min_bucket_size = int(self.min_bucket_size)
@@ -78,3 +80,35 @@ class LogUniformSampler(Sampler):
         generator.manual_seed(_seed(example_id, layer_idx, head_idx, vector_kind))
         random_values = torch.rand(probabilities.shape, generator=generator, device=device, dtype=torch.float32)
         return random_values < probabilities
+
+
+@dataclass(slots=True)
+class UniformSampler(Sampler):
+    base_rate: float = 1.0
+    bucket_size: int = 128
+    bucket_kind: str = "uniform"
+
+    def __post_init__(self) -> None:
+        if self.bucket_size < 1:
+            raise ValueError("bucket_size must be at least 1.")
+
+    def sample_positions(
+        self,
+        *,
+        layer_idx: int,
+        head_idx: int,
+        vector_kind: str,
+        example_id: int,
+        positions: torch.Tensor,
+        buckets: torch.Tensor,
+    ) -> torch.Tensor:
+        if positions.ndim != 1:
+            raise ValueError("Positions must be a 1D tensor.")
+        device = positions.device
+        denominator = float(self.bucket_size)
+        probability = min(1.0, float(self.base_rate) / denominator)
+        probs = torch.full_like(positions, fill_value=probability, dtype=torch.float32, device=device)
+        generator = torch.Generator(device=device)
+        generator.manual_seed(_seed(example_id, layer_idx, head_idx, vector_kind))
+        random_values = torch.rand(probs.shape, generator=generator, device=device, dtype=torch.float32)
+        return random_values < probs

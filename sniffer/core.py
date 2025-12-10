@@ -6,12 +6,12 @@ import math
 from queue import Queue
 from threading import Thread
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union, Literal
 
 import torch
 
 from saver.dataset import CaptureBatch, DatasetSaver
-from .samplers import LogUniformSampler, Sampler
+from .samplers import LogUniformSampler, UniformSampler, Sampler
 
 
 @dataclass(slots=True)
@@ -40,22 +40,33 @@ class Sniffer:
             readme_path=config.readme_path,
             write_batch_size=max(1, int(config.write_batch_size)),
         )
-        self.saver.register_model_metadata(self.config.model_name, self.config.metadata)
+        metadata = dict(self.config.metadata)
         self._example_ids: Optional[Sequence[int]] = None
         self._sequence_lengths: Optional[List[int]] = None
         requested_min_bucket = int(config.min_bucket_size)
         if requested_min_bucket < 1:
             raise ValueError("min_bucket_size must be at least 1.")
-        if requested_min_bucket == 1:
-            self._min_bucket_power = 0
-        else:
-            self._min_bucket_power = int(math.ceil(math.log2(requested_min_bucket)))
-        self._min_bucket_size = 1 << self._min_bucket_power
         self.sampler: Sampler = (
             config.sampler_factory()
             if config.sampler_factory is not None
-            else LogUniformSampler(min_bucket_size=self._min_bucket_size)
+            else LogUniformSampler(min_bucket_size=requested_min_bucket)
         )
+        self._bucket_kind = getattr(self.sampler, "bucket_kind", "log").lower()
+        if self._bucket_kind not in {"log", "uniform"}:
+            raise ValueError("Sampler must declare bucket_kind 'log' or 'uniform'.")
+        if self._bucket_kind == "log":
+            if requested_min_bucket == 1:
+                self._min_bucket_power = 0
+            else:
+                self._min_bucket_power = int(math.ceil(math.log2(requested_min_bucket)))
+            self._log_bucket_floor = float(self._min_bucket_power)
+            self._effective_min_bucket_size = 1 << self._min_bucket_power
+            metadata.setdefault("sampling_min_bucket_size", self._effective_min_bucket_size)
+        else:
+            self._uniform_bucket_size = requested_min_bucket
+            metadata.setdefault("sampling_bucket_size", self._uniform_bucket_size)
+        metadata.setdefault("sampling_strategy", self._bucket_kind)
+        self.saver.register_model_metadata(self.config.model_name, metadata)
         self._writer = _CaptureWorker(self.saver, queue_size=queue_size)
         self._max_rows_per_batch: Optional[int] = (
             int(config.max_rows_per_batch) if config.max_rows_per_batch and config.max_rows_per_batch > 0 else None
@@ -80,10 +91,14 @@ class Sniffer:
             positions = positions.to(device=device, dtype=torch.int64)
             example_ids = self._prepare_example_ids(batch_size, seq_len, device)
             positions_fp = positions.to(torch.float32)
-            raw_buckets = torch.floor(torch.log2(positions_fp + 1.0))
-            bucket_floor = float(self._min_bucket_power)
-            clamped = torch.clamp(raw_buckets, min=bucket_floor)
-            buckets = clamped.to(torch.int64)
+            if self._bucket_kind == "log":
+                raw_buckets = torch.floor(torch.log2(positions_fp + 1.0))
+                bucket_floor = float(self._min_bucket_power)
+                clamped = torch.clamp(raw_buckets, min=bucket_floor)
+                buckets = clamped.to(torch.int64)
+            else:
+                bucket_size = float(self._uniform_bucket_size)
+                buckets = torch.floor(positions_fp / bucket_size).to(torch.int64)
             valid_lengths = self._resolve_sequence_lengths(batch_size, seq_len)
 
             if self.config.capture_queries:
@@ -216,6 +231,7 @@ class Sniffer:
         if invalid:
             raise ValueError(f"Invalid head indices {invalid}; layer exposes {total_heads} heads.")
         return sorted(self.config.heads)
+
 
     def _maybe_downsample(
         self,

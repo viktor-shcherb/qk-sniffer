@@ -240,6 +240,9 @@ class DatasetReadme:
             lines.append(f"  - layers: {coverage['layer_count']}")
             lines.append(f"  - query heads: {coverage['query_heads']}")
             lines.append(f"  - key heads: {coverage['key_heads']}")
+            sampling = self._format_sampling_strategy(info)
+            if sampling:
+                lines.append(f"  - sampling: {sampling}")
             counts = bucket_counts.get(model, Counter())
             if counts:
                 bucket_str = ", ".join(f"b{bucket}={counts[bucket]}" for bucket in sorted(counts))
@@ -247,6 +250,22 @@ class DatasetReadme:
                 bucket_str = "(no samples)"
             lines.append(f"  - buckets: {bucket_str}")
         return "\n".join(lines)
+
+    def _format_sampling_strategy(self, info: Dict[str, Union[str, int, float]]) -> str:
+        strategy = str(info.get("sampling_strategy", "")).strip().lower()
+        if not strategy:
+            return ""
+        if strategy == "log":
+            size = info.get("sampling_min_bucket_size")
+            if size:
+                return f"log (min bucket size: {size})"
+            return "log"
+        if strategy == "uniform":
+            size = info.get("sampling_bucket_size")
+            if size:
+                return f"uniform (bucket width: {size})"
+            return "uniform"
+        return strategy
 
     def _model_capture_stats(self, config_splits: Dict[str, Set[str]]) -> Dict[str, Dict[str, int]]:
         stats: Dict[str, Dict[str, Set]] = {}
@@ -278,9 +297,9 @@ class DatasetReadme:
         rows = [
             (
                 "bucket",
-                "Base-2 exponent `i` used for sampling. Bucket `b{i}` corresponds to the canonical "
-                "`[2^i, 2^{i+1})` span; exponents below the configured minimum collapse into "
-                "`ceil(log2(effective_min))` so the first bucket always covers at least that many tokens.",
+                "Bucket identifier. `log` strategy stores the base-2 exponent `i` (bucket `b{i}` maps to "
+                "`[2^i, 2^{i+1})` and exponents below the configured minimum collapse upward); `uniform` strategy "
+                "stores `floor(position / bucket_width)` where `bucket_width` equals the configured chunk size.",
             ),
             ("example_id", "Index of the example within the batch when the vector was captured."),
             ("position", "Token position within the example's sequence (0-indexed)."),

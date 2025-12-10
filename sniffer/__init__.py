@@ -7,7 +7,7 @@ from .core import (
     set_active_sequence_lengths,
     use_sniffer,
 )
-from .samplers import LogUniformSampler, Sampler
+from .samplers import LogUniformSampler, UniformSampler, Sampler
 from .utils import compute_positions
 
 __all__ = [
@@ -20,5 +20,6 @@ __all__ = [
     "set_active_sequence_lengths",
     "Sampler",
     "LogUniformSampler",
+    "UniformSampler",
     "compute_positions",
 ]

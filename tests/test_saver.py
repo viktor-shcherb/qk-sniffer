@@ -108,7 +108,15 @@ def test_dataset_saver_add_batch_deduplicates_and_flushes(tmp_path):
 
 def test_dataset_saver_includes_model_stats_in_readme(tmp_path):
     saver = DatasetSaver(root=tmp_path / "data", readme_path=tmp_path / "README.md")
-    saver.register_model_metadata("meta/llama3-8b", {"source_dataset": "dummy/dataset", "dataset_split": "train"})
+    saver.register_model_metadata(
+        "meta/llama3-8b",
+        {
+            "source_dataset": "dummy/dataset",
+            "dataset_split": "train",
+            "sampling_strategy": "log",
+            "sampling_min_bucket_size": 128,
+        },
+    )
     row = _row("meta/llama3-8b", layer=0, head=0, kind="q", bucket=2, example_id=0, position=0, vector=[0.1, 0.2])
     saver.add(row)
     saver.close()
@@ -116,6 +124,7 @@ def test_dataset_saver_includes_model_stats_in_readme(tmp_path):
     assert "dummy/dataset" in readme
     assert "b2=1" in readme
     assert "split: `meta_llama3_8b`" in readme
+    assert "sampling: log" in readme
     assert "layers: 1" in readme
     assert "query heads: 1" in readme
     assert "key heads: 0" in readme

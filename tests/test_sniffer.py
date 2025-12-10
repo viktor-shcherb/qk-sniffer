@@ -10,6 +10,7 @@ import yaml
 
 from sniffer import (
     LogUniformSampler,
+    UniformSampler,
     Sampler,
     Sniffer,
     SnifferConfig,
@@ -22,15 +23,27 @@ from sniffer import (
 
 
 class AlwaysSampler(Sampler):
+    bucket_kind = "log"
+
     def sample_positions(self, **kwargs):
         positions: torch.Tensor = kwargs["positions"]
         return torch.ones_like(positions, dtype=torch.bool)
 
 
 class BucketZeroSampler(Sampler):
+    bucket_kind = "log"
+
     def sample_positions(self, **kwargs):
         buckets: torch.Tensor = kwargs["buckets"]
         return buckets == 0
+
+
+class UniformBucketSampler(Sampler):
+    bucket_kind = "uniform"
+
+    def sample_positions(self, **kwargs):
+        positions: torch.Tensor = kwargs["positions"]
+        return torch.ones_like(positions, dtype=torch.bool)
 
 
 def test_sniffer_captures_qk(tmp_path):
@@ -385,6 +398,40 @@ def test_log_uniform_sampler_bucket_size_scaling():
 def test_log_uniform_sampler_rejects_invalid_min_bucket_size():
     with pytest.raises(ValueError, match="min_bucket_size"):
         LogUniformSampler(base_rate=1.0, min_bucket_size=0)
+
+
+def test_sniffer_uniform_bucket_strategy(tmp_path):
+    config = SnifferConfig(
+        model_name="meta/llama3-8b",
+        data_root=tmp_path / "data",
+        readme_path=tmp_path / "README.md",
+        sampler_factory=lambda: UniformBucketSampler(),
+        min_bucket_size=50,
+    )
+    sniffer = Sniffer(config)
+    states = torch.ones(1, 1, 5, 4)
+    positions = torch.tensor([[0, 10, 49, 50, 120]], dtype=torch.int64, device=states.device)
+    sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
+    sniffer.close()
+
+    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    table = pq.read_table(q_path)
+    assert table.column("bucket").to_pylist() == [0, 0, 0, 1, 2]
+
+
+def test_uniform_sampler_probability_clamps():
+    sampler = UniformSampler(base_rate=64.0, bucket_size=32)
+    positions = torch.arange(6, dtype=torch.int64)
+    buckets = torch.zeros_like(positions)
+    mask = sampler.sample_positions(
+        layer_idx=0,
+        head_idx=0,
+        vector_kind="q",
+        example_id=42,
+        positions=positions,
+        buckets=buckets,
+    )
+    assert mask.all().item()
 
 
 def test_compute_positions_matches_reference():

@@ -26,6 +26,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from sniffer import (
     LogUniformSampler,
     SnifferConfig,
+    UniformSampler,
     activate_sniffer,
     set_active_example_ids,
     set_active_sequence_lengths,
@@ -187,13 +188,23 @@ def resolve_primary_device(model: AutoModelForCausalLM) -> torch.device:
 
 
 def build_sampler_factory(settings: SamplerSettings, *, min_bucket_size: int):
-    if settings.type != "log_uniform":
-        raise ValueError(f"Unsupported sampler type '{settings.type}'.")
+    sampler_type = settings.type.lower()
 
-    def factory():
-        return LogUniformSampler(base_rate=settings.base_rate, min_bucket_size=min_bucket_size)
+    if sampler_type == "log_uniform":
 
-    return factory
+        def factory():
+            return LogUniformSampler(base_rate=settings.base_rate, min_bucket_size=min_bucket_size)
+
+        return factory
+
+    if sampler_type == "uniform":
+
+        def factory():
+            return UniformSampler(base_rate=settings.base_rate, bucket_size=max(1, int(min_bucket_size)))
+
+        return factory
+
+    raise ValueError(f"Unsupported sampler type '{settings.type}'.")
 
 
 def batch_iter(dataset: Dataset, settings: DatasetSettings, batch_size: int) -> Iterable[Dict[str, Any]]:
