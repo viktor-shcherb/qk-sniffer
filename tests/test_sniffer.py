@@ -39,6 +39,7 @@ def test_sniffer_captures_qk(tmp_path):
         data_root=tmp_path / "data",
         readme_path=tmp_path / "README.md",
         sampler_factory=lambda: AlwaysSampler(),
+        min_bucket_size=1,
     )
     sniffer = Sniffer(config)
 
@@ -77,6 +78,7 @@ def test_sniffer_respects_cache_position(tmp_path):
         readme_path=tmp_path / "README.md",
         capture_keys=False,
         sampler_factory=lambda: AlwaysSampler(),
+        min_bucket_size=1,
     )
     sniffer = Sniffer(config)
 
@@ -104,6 +106,7 @@ def test_sniffer_custom_example_ids(tmp_path):
         data_root=tmp_path / "data",
         readme_path=tmp_path / "README.md",
         sampler_factory=lambda: AlwaysSampler(),
+        min_bucket_size=1,
     )
     sniffer = Sniffer(config)
     sniffer.set_example_ids([42])
@@ -129,6 +132,7 @@ def test_sniffer_respects_sequence_lengths(tmp_path):
         data_root=tmp_path / "data",
         readme_path=tmp_path / "README.md",
         sampler_factory=lambda: AlwaysSampler(),
+        min_bucket_size=1,
     )
     sniffer = Sniffer(config)
     sniffer.set_sequence_lengths([2])
@@ -151,6 +155,7 @@ def test_sniffer_max_rows_per_batch(tmp_path):
         readme_path=tmp_path / "README.md",
         max_rows_per_batch=1,
         sampler_factory=lambda: AlwaysSampler(),
+        min_bucket_size=1,
     )
     sniffer = Sniffer(config)
     states = torch.randn(1, 1, 4, 4)
@@ -171,6 +176,7 @@ def test_sniffer_respects_layer_and_head_filters(tmp_path):
         layers={1},
         heads={0},
         sampler_factory=lambda: AlwaysSampler(),
+        min_bucket_size=1,
     )
     sniffer = Sniffer(config)
     states = torch.randn(1, 2, 2, 4)
@@ -195,6 +201,7 @@ def test_sniffer_toggle_queries_vs_keys(tmp_path):
         capture_queries=False,
         capture_keys=True,
         sampler_factory=lambda: AlwaysSampler(),
+        min_bucket_size=1,
     )
     sniffer = Sniffer(config)
     states = torch.randn(1, 1, 1, 4)
@@ -213,6 +220,7 @@ def test_sniffer_example_id_mismatch_raises(tmp_path):
         data_root=tmp_path / "data",
         readme_path=tmp_path / "README.md",
         sampler_factory=lambda: AlwaysSampler(),
+        min_bucket_size=1,
     )
     sniffer = Sniffer(config)
     sniffer.set_example_ids([1, 2])
@@ -228,6 +236,7 @@ def test_set_active_example_ids_updates_current_session(tmp_path):
         data_root=tmp_path / "data",
         readme_path=tmp_path / "README.md",
         sampler_factory=lambda: AlwaysSampler(),
+        min_bucket_size=1,
     )
     with activate_sniffer(config) as sniffer:
         assert get_active_sniffer() is sniffer
@@ -246,6 +255,7 @@ def test_set_active_sequence_lengths_updates_current_session(tmp_path):
         data_root=tmp_path / "data",
         readme_path=tmp_path / "README.md",
         sampler_factory=lambda: AlwaysSampler(),
+        min_bucket_size=1,
     )
     with activate_sniffer(config) as sniffer:
         set_active_sequence_lengths([1])
@@ -263,10 +273,11 @@ def test_custom_sampler_drops_non_zero_buckets(tmp_path):
         data_root=tmp_path / "data",
         readme_path=tmp_path / "README.md",
         sampler_factory=lambda: BucketZeroSampler(),
+        min_bucket_size=1,
     )
     sniffer = Sniffer(config)
     states = torch.ones(1, 1, 3, 4)
-    positions = compute_positions(batch_size=1, seq_len=3, device=states.device, cache_position=None)
+    positions = torch.tensor([[0, 256, 400]], dtype=torch.int64, device=states.device)
     sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
     sniffer.close()
 
@@ -276,8 +287,64 @@ def test_custom_sampler_drops_non_zero_buckets(tmp_path):
     assert table.num_rows == 1  # only bucket 0 kept
 
 
+def test_sniffer_default_min_bucket_size_groups_positions(tmp_path):
+    config = SnifferConfig(
+        model_name="meta/llama3-8b",
+        data_root=tmp_path / "data",
+        readme_path=tmp_path / "README.md",
+        sampler_factory=lambda: AlwaysSampler(),
+    )
+    sniffer = Sniffer(config)
+    states = torch.ones(1, 1, 5, 4)
+    positions = torch.tensor([[0, 1, 127, 128, 384]], dtype=torch.int64, device=states.device)
+    sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
+    sniffer.close()
+
+    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    table = pq.read_table(q_path)
+    assert table.column("bucket").to_pylist() == [7, 7, 7, 7, 8]
+
+
+def test_sniffer_custom_min_bucket_size(tmp_path):
+    config = SnifferConfig(
+        model_name="meta/llama3-8b",
+        data_root=tmp_path / "data",
+        readme_path=tmp_path / "README.md",
+        sampler_factory=lambda: AlwaysSampler(),
+        min_bucket_size=4,
+    )
+    sniffer = Sniffer(config)
+    states = torch.ones(1, 1, 4, 4)
+    positions = torch.tensor([[0, 3, 4, 12]], dtype=torch.int64, device=states.device)
+    sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
+    sniffer.close()
+
+    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    table = pq.read_table(q_path)
+    assert table.column("bucket").to_pylist() == [2, 2, 2, 3]
+
+
+def test_sniffer_min_bucket_size_rounds_up(tmp_path):
+    config = SnifferConfig(
+        model_name="meta/llama3-8b",
+        data_root=tmp_path / "data",
+        readme_path=tmp_path / "README.md",
+        sampler_factory=lambda: AlwaysSampler(),
+        min_bucket_size=130,
+    )
+    sniffer = Sniffer(config)
+    states = torch.ones(1, 1, 3, 4)
+    positions = torch.tensor([[0, 200, 511]], dtype=torch.int64, device=states.device)
+    sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
+    sniffer.close()
+
+    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    table = pq.read_table(q_path)
+    assert table.column("bucket").to_pylist() == [8, 8, 9]
+
+
 def test_log_uniform_sampler_deterministic():
-    sampler = LogUniformSampler(base_rate=1.0)
+    sampler = LogUniformSampler(base_rate=1.0, min_bucket_size=1)
     buckets = torch.tensor([0, 1, 1, 2], dtype=torch.int64)
     positions = torch.arange(4, dtype=torch.int64)
     mask1 = sampler.sample_positions(
@@ -300,7 +367,7 @@ def test_log_uniform_sampler_deterministic():
 
 
 def test_log_uniform_sampler_bucket_size_scaling():
-    sampler = LogUniformSampler(base_rate=4.0)
+    sampler = LogUniformSampler(base_rate=4.0, min_bucket_size=1)
     buckets = torch.tensor([0, 1, 1, 2, 2, 2, 2], dtype=torch.int64)
     positions = torch.arange(len(buckets), dtype=torch.int64)
     mask = sampler.sample_positions(
@@ -313,6 +380,11 @@ def test_log_uniform_sampler_bucket_size_scaling():
     )
     # base_rate equals bucket_size up to bucket 2, so every entry kept deterministically
     assert mask.all().item()
+
+
+def test_log_uniform_sampler_rejects_invalid_min_bucket_size():
+    with pytest.raises(ValueError, match="min_bucket_size"):
+        LogUniformSampler(base_rate=1.0, min_bucket_size=0)
 
 
 def test_compute_positions_matches_reference():
@@ -341,6 +413,7 @@ def test_sniffer_multiple_models_share_dataset(tmp_path):
             data_root=data_root,
             readme_path=readme_path,
             sampler_factory=lambda: AlwaysSampler(),
+            min_bucket_size=1,
         )
         sniffer = Sniffer(config)
         states = torch.full((1, 1, 1, 4), fill_value, dtype=torch.float32)

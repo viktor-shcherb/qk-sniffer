@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+import math
 from queue import Queue
 from threading import Thread
 from pathlib import Path
@@ -27,6 +28,7 @@ class SnifferConfig:
     queue_size: int = 8
     max_rows_per_batch: Optional[int] = None
     write_batch_size: int = 2048
+    min_bucket_size: int = 128
 
 
 class Sniffer:
@@ -41,10 +43,18 @@ class Sniffer:
         self.saver.register_model_metadata(self.config.model_name, self.config.metadata)
         self._example_ids: Optional[Sequence[int]] = None
         self._sequence_lengths: Optional[List[int]] = None
+        requested_min_bucket = int(config.min_bucket_size)
+        if requested_min_bucket < 1:
+            raise ValueError("min_bucket_size must be at least 1.")
+        if requested_min_bucket == 1:
+            self._min_bucket_power = 0
+        else:
+            self._min_bucket_power = int(math.ceil(math.log2(requested_min_bucket)))
+        self._min_bucket_size = 1 << self._min_bucket_power
         self.sampler: Sampler = (
             config.sampler_factory()
             if config.sampler_factory is not None
-            else LogUniformSampler()
+            else LogUniformSampler(min_bucket_size=self._min_bucket_size)
         )
         self._writer = _CaptureWorker(self.saver, queue_size=queue_size)
         self._max_rows_per_batch: Optional[int] = (
@@ -69,7 +79,11 @@ class Sniffer:
             device = query_states.device
             positions = positions.to(device=device, dtype=torch.int64)
             example_ids = self._prepare_example_ids(batch_size, seq_len, device)
-            buckets = torch.floor(torch.log2(positions.to(torch.float32) + 1)).to(torch.int64)
+            positions_fp = positions.to(torch.float32)
+            raw_buckets = torch.floor(torch.log2(positions_fp + 1.0))
+            bucket_floor = float(self._min_bucket_power)
+            clamped = torch.clamp(raw_buckets, min=bucket_floor)
+            buckets = clamped.to(torch.int64)
             valid_lengths = self._resolve_sequence_lengths(batch_size, seq_len)
 
             if self.config.capture_queries:

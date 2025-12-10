@@ -133,7 +133,12 @@ class DatasetSaver:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.compression = compression
-        self.readme_path = Path(readme_path)
+        raw_readme_path = Path(readme_path)
+        if raw_readme_path.is_absolute():
+            resolved_readme_path = raw_readme_path
+        else:
+            resolved_readme_path = self.root / raw_readme_path
+        self.readme_path = resolved_readme_path
         self._sinks: Dict[Tuple[str, str], _ParquetSink] = {}
         self._config_splits: Dict[str, Set[str]] = {}
         self._models: Set[str] = set()
@@ -141,11 +146,13 @@ class DatasetSaver:
         self._position_cache: Dict[Tuple[str, str], Set[Tuple[int, int]]] = {}
         self._model_metadata: Dict[str, Dict[str, Union[str, int, float]]] = {}
         self._bucket_counts: Dict[str, Counter] = defaultdict(Counter)
-        self._readme = DatasetReadme(readme_path, self.root, dataset_name)
+        self._readme = DatasetReadme(self.readme_path, self.root, dataset_name)
         self._write_batch_size = max(1, int(write_batch_size))
         self._pending: Dict[Tuple[str, str], Dict[str, List]] = {}
         self._state_path = self.root / "_saver_state.json"
         self._load_state()
+        for model_name in list(self._model_metadata.keys()):
+            self._ensure_sanitized_metadata(model_name)
         self._seed_existing_entries()
 
     def add(self, row: CaptureRow) -> None:
@@ -184,6 +191,7 @@ class DatasetSaver:
 
         split = batch.model_name
         storage_split = self._sanitized_splits.setdefault(split, _sanitize_split(split))
+        self._ensure_sanitized_metadata(split)
         config = batch.config_name
         key = (storage_split, config)
         position_cache = self._position_cache.setdefault(key, self._load_existing_positions(storage_split, config))
@@ -273,7 +281,7 @@ class DatasetSaver:
         self.close()
 
     def register_model_metadata(self, model_name: str, metadata: Dict[str, Union[str, int, float]]) -> None:
-        sanitized = self._sanitized_splits.setdefault(model_name, _sanitize_split(model_name))
+        sanitized = self._ensure_sanitized_metadata(model_name)
         self._model_metadata.setdefault(model_name, {}).update(metadata)
         self._models.add(model_name)
         (self.root / sanitized).mkdir(parents=True, exist_ok=True)
@@ -333,6 +341,7 @@ class DatasetSaver:
                 if isinstance(meta, dict):
                     self._model_metadata.setdefault(model_name, {}).update(meta)
                     self._models.add(model_name)
+                    self._ensure_sanitized_metadata(model_name)
 
         bucket_counts = data.get("bucket_counts", {})
         if isinstance(bucket_counts, dict):
@@ -349,6 +358,7 @@ class DatasetSaver:
                 if counter:
                     self._bucket_counts[model_name].update(counter)
                     self._models.add(model_name)
+                    self._ensure_sanitized_metadata(model_name)
 
     def _save_state(self) -> None:
         bucket_counts = {
@@ -364,6 +374,13 @@ class DatasetSaver:
             self._state_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
         except Exception:
             pass
+
+    def _ensure_sanitized_metadata(self, model_name: str) -> str:
+        sanitized = self._sanitized_splits.setdefault(model_name, _sanitize_split(model_name))
+        meta = self._model_metadata.setdefault(model_name, {})
+        if meta.get("sanitized_split") != sanitized:
+            meta["sanitized_split"] = sanitized
+        return sanitized
 
 
 def _to_numpy(vector: Union["np.ndarray", "torch.Tensor", Sequence[float]]) -> "np.ndarray":

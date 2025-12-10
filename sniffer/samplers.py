@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import math
 
 import torch
 
@@ -35,6 +36,19 @@ def _seed(example_id: int, layer_idx: int, head_idx: int, vector_kind: str) -> i
 @dataclass(slots=True)
 class LogUniformSampler(Sampler):
     base_rate: float = 1.0
+    min_bucket_size: int = 128
+
+    def __post_init__(self) -> None:
+        min_bucket_size = int(self.min_bucket_size)
+        if min_bucket_size < 1:
+            raise ValueError("min_bucket_size must be at least 1.")
+        if min_bucket_size == 1:
+            self._min_bucket_power = 0
+        else:
+            self._min_bucket_power = int(math.ceil(math.log2(min_bucket_size)))
+        self._min_bucket_size = 1 << self._min_bucket_power
+        self.min_bucket_size = self._min_bucket_size
+        self._min_bucket_floor = float(self._min_bucket_power)
 
     def sample_positions(
         self,
@@ -52,8 +66,9 @@ class LogUniformSampler(Sampler):
         _ = positions
         device = buckets.device
         bucket_tensor = buckets.to(device=device, dtype=torch.float32)
-        # bucket i spans [2^i, 2^{i+1}), theoretical size is 2^i
-        bucket_sizes = torch.pow(2.0, torch.clamp(bucket_tensor, min=0.0))
+        bucket_tensor = torch.clamp(bucket_tensor, min=self._min_bucket_floor)
+        # bucket i spans 2^i positions; clamp enforces minimum bucket width
+        bucket_sizes = torch.pow(2.0, bucket_tensor)
         denominator = torch.clamp(bucket_sizes, min=1.0)
         probabilities = torch.minimum(
             torch.ones_like(denominator),

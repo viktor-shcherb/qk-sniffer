@@ -115,6 +115,20 @@ def test_dataset_saver_includes_model_stats_in_readme(tmp_path):
     readme = (tmp_path / "README.md").read_text()
     assert "dummy/dataset" in readme
     assert "b2=1" in readme
+    assert "split: `meta_llama3_8b`" in readme
+    assert "layers: 1" in readme
+    assert "query heads: 1" in readme
+    assert "key heads: 0" in readme
+
+
+def test_relative_readme_path_is_saved_inside_data_root(tmp_path):
+    data_root = tmp_path / "data"
+    saver = DatasetSaver(root=data_root, readme_path="README.md")
+    saver.add(_row("meta/llama3-8b", layer=0, head=0, kind="q", bucket=0, example_id=0, position=0, vector=[0.1]))
+    saver.close()
+
+    assert (data_root / "README.md").exists()
+    assert not (tmp_path / "README.md").exists()
 
 
 def test_dataset_saver_preserves_model_stats_across_runs(tmp_path):

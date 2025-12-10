@@ -1,194 +1,95 @@
 # qk-sniffer
 
-`qk-sniffer` instruments Hugging Face transformer models so every attention layer can stream sampled key/query vectors into a structured dataset. It ships with ready-made patches for Gemma 3 and Llama families, a deterministic sampler, and a CLI that syncs results to the Hugging Face Hub.
+`qk-sniffer` instruments Hugging Face transformer models so each attention layer can stream sampled key/query vectors into Parquet shards that mirror Hugging Face dataset repos. It ships with Gemma 3/Llama hooks, a deterministic sampler, and a CLI (`sniff-qk`) that can pull/push full datasets from the Hub.
 
-## Highlights
-- **Zero-touch model overrides** – drop a mirrored module under `models/<name>/modeling_<name>.py` and `patch_modeling_modules()` automatically registers it under `transformers.models.*` before any model loads.
-- **Deterministic sampling & metadata** – `LogUniformSampler` keeps attention load manageable by sampling positions per bucket with a reproducible RNG seeded by `(example, layer, head, kind)`.
-- **Structured storage with README automation** – `DatasetSaver` writes Parquet shards under sanitized split/config folders, deduplicates `(example_id, position)` pairs, and rewrites the dataset README so `datasets.load_dataset` immediately works against the folder or Hub repo.
-- **Turn-key CLI** – `sniff.py` (exported as `sniff-qk`) loads configs from YAML, pulls a Hub dataset snapshot, runs inference with your model/tokenizer choices, captures vectors, and optionally pushes the updated dataset back to the Hub.
+## Requirements & Installation
+- Python 3.9+, recent PyTorch build matching your hardware.
+- (Optional) create and activate a virtualenv.
+- Install in editable mode so `models/` is importable:
+  ```bash
+  pip install --upgrade pip
+  pip install -e .
+  ```
+- Put secrets (e.g., `HF_TOKEN`) in a `.env`; `python-dotenv` loads them automatically.
 
-## Repository Layout
-- `sniff.py` – CLI entrypoint plus helper utilities (`run_inference`, `patch_modeling_modules`, etc.).
-- `sniffer/` – reusable runtime (samplers, context managers, dataset capture logic).
-- `models/` – mirrored transformer modules with sniffer hooks (Gemma 3, Llama).
-- `saver/` – dataset writer + README generator used by the runtime.
-- `configs/` – sample YAML configuration (`configs/sample_sniff.yaml`).
-- `tests/` – pytest suite covering model patching, sampler behavior, saver layout, and CLI helpers.
-
-## Installation
-1. Use Python ≥3.9 and install PyTorch that matches your hardware.
-2. (Optional) Create a virtual environment:
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate
+## Quick Start
+1. **Instrument the model (if needed).** Copy the relevant `transformers` module into `models/<name>/modeling_<name>.py`, import `get_active_sniffer`/`compute_positions`, and call `sniffer.capture(...)` inside the attention block. Gemma 3 + Llama are already wired up.
+2. **Create a config** (adapt the sample below):
+   ```yaml
+   dataset:
+     path: viktoroo/example
+     split: train
+     text_column: text
+   model:
+     name: google/gemma-2-2b
+     dtype: float16
+   tokenizer:
+     name: google/gemma-2-2b
+     max_length: 4096
+   inference:
+     batch_size: 2
+     autocast_dtype: float16
+   capture:
+     capture_queries: true
+     capture_keys: true
+     min_bucket_size: 128
+     sampler:
+       type: log_uniform
+       base_rate: 1.0
+   output:
+     data_root: data/sniffed-qk
+     readme_path: README.md
+     hf_repo_id: viktoroo/sniffed-qk
    ```
-3. Install the project in editable mode so the `models` package is importable. Installations default to the latest compatible releases, but for reproducible runs pin the Python and dependency versions listed in `pyproject.toml`/`requirements.txt` (e.g., by exporting a lockfile after testing):
-   ```bash
-   pip install --upgrade pip
-   pip install -e .
-   ```
-
-### Version pinning & reproducibility
-- The project targets Python 3.9+; develop with your preferred interpreter, but for complete reproducibility the Python version can be found at `.python-version`.
-- Install pinned dependencies with `pip install -r requirements-pinned.txt` or install the latest versions with `pip install -e . --upgrade`.
-
-### Environment variables
-- Create a `.env` file at the repo root and set `HF_TOKEN=<your Hugging Face token>` (plus any overrides such as `TARGET_DATASET_ID`). Both the CLI and utility scripts call `python-dotenv` automatically, so the values are available without exporting them in your shell.
-
-## Running a Capture
-1. **Ensure instrumentation exists.** Out of the box Gemma 3 and Llama modules live under `models/` with sniffer hooks. To extend another model, copy its `transformers` implementation into `models/<name>/modeling_<name>.py` and add the `get_active_sniffer()` logic described below.
-2. **Create a config.** Use `configs/sample_sniff.yaml` as a template and adjust dataset/model/tokenizer/capture/output sections.
-3. **Launch the CLI.** Once installed, run either script form:
+3. **Run the CLI**:
    ```bash
    sniff-qk --config configs/sample_sniff.yaml
-   # or, if running from source without installation
+   # or
    PYTHONPATH=. python sniff.py --config configs/sample_sniff.yaml
    ```
-   At startup the CLI calls `patch_modeling_modules()` so your mirrored modules shadow `transformers`. It optionally downloads the current dataset snapshot (`output.hf_repo_id`) into `output.data_root`, runs inference + capture, then uploads the folder back to the Hub when finished.
+   The CLI patches local modeling files into `transformers`, downloads the latest dataset snapshot (if `hf_repo_id` is set), runs inference, writes captures to a staging directory, refreshes the local dataset from the Hub again, replays the new rows on top, then uploads the result.
 
-## YAML Configuration Reference
+## Key Configuration Notes
+- `dataset.*` maps directly to `datasets.load_dataset`. Set `max_samples` for dry runs.
+- `model.*`/`tokenizer.*` feed `AutoModelForCausalLM` and `AutoTokenizer`. `device_map=auto` works well for multi-GPU.
+- `capture.*`
+  - `layers`, `heads` accept Python-style integer lists; omit to capture every head.
+  - `min_bucket_size` is rounded **up** to the next power of two; bucket IDs are the corresponding exponent (`b{i}` refers to `[2^i, 2^{i+1})`). Positions whose exponent is smaller than `ceil(log2(min_bucket_size_rounded))` collapse into that `i`, so the first bucket spans at least the requested width.
+  - `sampler.type=log_uniform` keeps roughly `base_rate` tokens per bucket via a deterministic RNG seeded by `(example, layer, head, kind)`.
+- `output.*`
+  - `data_root` is both your working directory and (optionally) the local clone of `hf_repo_id`.
+  - `sniff.py` writes staged captures to a temp folder, then re-pulls `hf_repo_id` before merging so concurrent remote updates win.
 
-```yaml
-dataset:
-  path: viktoroo/example-dataset
-  name: null            # optional dataset config
-  split: train
-  text_column: text
-  id_column: id         # optional logical ID per row
-  max_samples: 128      # optional cap
+## Capture Output & Dataset Layout
+- Each `(model split, layer, head, vector_kind)` writes to `data/<sanitized_model>/<lXXhYY{q|k}>/data.parquet`. Splits sanitize `[\W]` → `_` (e.g., `meta/llama3-8b` → `meta_llama3_8b`).
+- `DatasetSaver` deduplicates `(example_id, position)` pairs per config by seeding an in-memory cache from existing Parquet shards, so reruns append only new tokens.
+- The saver rewrites `output.readme_path` with Hugging Face front matter listing every config plus aggregate helpers such as `all`, `layer00`, `all_q`, etc., so `datasets.load_dataset` can point at the folder or Hub repo immediately.
+- Columns:
 
-model:
-  name: google/gemma-2-2b
-  revision: main
-  dtype: float16        # float16|bfloat16|float32 aliases supported
-  device_map: auto      # forwarded to transformers AutoModel
-  trust_remote_code: false
+  | Column | Description |
+  | --- | --- |
+  | `bucket` | Base-2 exponent `i`; bucket `b{i}` corresponds to `[2^i, 2^{i+1})`. Values below the minimum exponent collapse so the first bucket covers ≥ `min_bucket_size`. |
+  | `example_id` | Batch ID from `set_active_example_ids` (or the implicit index). |
+  | `position` | Token index after any cache offset. |
+  | `vector` | Float32 list representing the captured query/key vector. |
+  | `sliding_window` | Sliding-window size for local attention layers (`null` for full causal). |
 
-tokenizer:
-  name: google/gemma-2-2b
-  max_length: 4096
-  padding: longest
-
-inference:
-  batch_size: 2
-  autocast_dtype: float16
-
-capture:
-  capture_queries: true
-  capture_keys: true
-  layers: null          # optional whitelist
-  heads: null           # optional whitelist
-  sampler:
-    type: log_uniform
-    base_rate: 1.0
-
-output:
-  data_root: data/sniffed-qk
-  readme_path: README.md
-  hf_repo_id: viktoroo/sniffed-qk       # leave null to stay local
-```
-
-**Field summary**
-- `dataset.*` drives `datasets.load_dataset`. `max_samples` trims the split locally if you just want a quick smoke test.
-- `model.*` feeds `AutoModelForCausalLM.from_pretrained`. `dtype` goes through `resolve_dtype`, and `device_map="auto"` enables multi-GPU sharding.
-- `tokenizer.*` applies to `AutoTokenizer`. If you omit `name`, it falls back to `model.name`. The CLI forces `padding_side="right"` so padded tokens always sit at the end of the sequence and can be ignored safely.
-- `inference.batch_size` controls the streaming iterator size; `autocast_dtype` only matters when CUDA is available.
-- `capture.*` toggles which vectors flow to disk. `layers`/`heads` accept Python-style integer lists; pass nothing to capture every head. `sampler.type` currently supports `log_uniform` (custom samplers are pluggable; see below). The dataset split name always mirrors `model.name`.
-- `output.data_root`/`readme_path` define where Parquet shards and the generated README live locally. If `readme_path` is relative it’s resolved inside `data_root`, so the README travels with the folder when uploading to the Hub. Set `hf_repo_id` to enable pull/push.
-
-All bundled configs target the shared Hugging Face dataset `viktoroo/sniffed-qk`. Every run pulls the latest snapshot, writes new splits under sanitised model names, and pushes the combined folder so multiple checkpoints can coexist in one dataset.
-
-### Included sample configs
-
-| File | Model checkpoint | Max context | Notes |
-| --- | --- | --- | --- |
-| `configs/sample_sniff.yaml` | `google/gemma-2-2b` | 4,096 tokens | Demo config that matches the walkthrough above. |
-| `configs/smollm2-135m.yaml` | `HuggingFaceTB/SmolLM2-135M` | 8,192 tokens | Smallest SmolLM2 baseline; ingests `viktoroo/fineweb-edu-long-context-sample`, batch size 4, publishes to `viktoroo/sniffed-qk` split `HuggingFaceTB_SmolLM2_135M`. |
-| `configs/smollm2-360m.yaml` | `HuggingFaceTB/SmolLM2-360M` | 8,192 tokens | Medium SmolLM2; same dataset, batch size 2, pushes to the shared dataset split `HuggingFaceTB_SmolLM2_360M`. |
-| `configs/smollm2-1.7b.yaml` | `HuggingFaceTB/SmolLM2-1.7B` | 8,192 tokens | Standard 1.7 B checkpoint; writes captures into the shared repo split `HuggingFaceTB_SmolLM2_1_7B`. |
-| `configs/smollm2-2.2b-instruct.yaml` | `HuggingFaceTB/SmolLM2-2.2B-Instruct` | 16,384 tokens | 16 K instruct variant; publishes to `viktoroo/sniffed-qk` split `HuggingFaceTB_SmolLM2_2_2B_Instruct`. |
-
-## Internals & Architecture
-
-### Model patching & instrumentation
-- `patch_modeling_modules(root=Path("models"))` walks every Python file under the given `models` root, temporarily prepends `root.parent` to `sys.path`, and aliases both package and module names into `sys.modules` under `transformers.models.*`. That means `transformers.models.llama.modeling_llama` now points at `models/llama/modeling_llama.py`.
-- The CLI invokes this helper automatically, but you can call it manually in custom scripts (e.g., `sniff.patch_modeling_modules(root=Path("/tmp/my_models"))`).
-- Inside each mirrored attention module, wrap the attention forward pass:
-  ```python
-  from sniffer import compute_positions, get_active_sniffer
-
-  sniffer = get_active_sniffer()
-  if sniffer is not None:
-      positions = compute_positions(
-          batch_size=query_states.shape[0],
-          seq_len=query_states.shape[2],
-          device=query_states.device,
-          cache_position=cache_position,
-      )
-      sniffer.capture(
-          layer_idx=self.layer_idx,
-          query_states=query_states,
-          key_states=key_states,
-          positions=positions,
-          sliding_window=self.sliding_window,
-      )
-  ```
-- Use `set_active_example_ids([...])` inside your dataloader loop to ensure captures store the true IDs. If you skip it, the runtime defaults to `[0, 1, …]` per batch.
-- Call `set_active_sequence_lengths([...])` (the CLI does this automatically) to provide the valid token counts for the current batch, ensuring padded positions are never captured regardless of batch padding length.
-
-### Sniffer runtime & sampling
-- `activate_sniffer(SnifferConfig)` opens a context manager around the capture session. `run_inference` does this once at startup, so all instrumentation simply grabs `get_active_sniffer()`.
-- `Sniffer.capture` receives query/key tensors `(batch, heads, seq, dim)` and the per-token position tensor. It respects `layers`/`heads` filters and `capture_queries`/`capture_keys`.
-- Sampling goes through the configured `Sampler`. Implementations take `positions` and log₂ `buckets` (calculated as `floor(log2(position + 1))`) and return a boolean mask per token. `LogUniformSampler` keeps `≈base_rate` tokens per bucket using a deterministic RNG seeded by `(example_id, layer_idx, head_idx, vector_kind)`, so reruns of the same data produce the same rows.
-
-### Dataset saver & Hub sync
-- `DatasetSaver` writes each `(model split, config)` pair to `data/<sanitized_split>/<config>/data.parquet`. Splits sanitize non-word characters (`meta/llama3-8b` → `meta_llama3_8b`). Configs are always `lXXhYY{q|k}`.
-- Duplicate `(example_id, position)` rows are skipped automatically by keeping an in-memory cache per split/config and seeding it with previously written Parquet data. This lets you resume runs without rewriting identical entries.
-- The saver also tracks per-model metadata (`source_dataset`, `dataset_split`, etc.) and bucket counts so the README can surface capture coverage.
-- `pull_remote_dataset`/`push_remote_dataset` wrap `huggingface_hub.snapshot_download` and `api.upload_folder`. They respect `output.hf_repo_id`; leave it unset to avoid network calls.
-
-## Dataset Columns
-
-| Column | Description |
-| --- | --- |
-| `bucket` | Log₂ bucket identifier for the sampled position (`0` → first token, `1` → positions `[2,3]`, etc.). |
-| `example_id` | ID supplied by `set_active_example_ids` or the implicit batch index. |
-| `position` | Token index inside the example after any cache offset/truncation. |
-| `vector` | Float32 array representing the captured key or query vector. |
-| `sliding_window` | Optional sliding-window size for local attention layers (`null` for full causal attention). |
-
-Every split/config folder only contains `data.parquet`, but the generated README front matter also includes aggregated configs:
-- `all` / `all_q` / `all_k`
-- `layerXX`, `layerXX_q`, `layerXX_k`
-- Specific heads (`l00h00q`, `l00h03k`, …)
-
-These entries reference glob patterns within `data_root`, so the Hugging Face Hub immediately exposes each subset.
-
-## Loading Captures
+Loading example:
 ```python
 from datasets import load_dataset
 
-# layer 0, head 0, queries captured from the gemma model
-queries = load_dataset("viktoroo/sniffed-qk", "l00h00q", split="google_gemma3_9b")
-
-# aggregated helpers exposed by the README front matter:
+queries = load_dataset("viktoroo/sniffed-qk", "l00h00q", split="meta_llama3_8b")
 layer0_all_heads = load_dataset("viktoroo/sniffed-qk", "layer00", split="meta_llama3_8b")
-all_queries = load_dataset("viktoroo/sniffed-qk", "all_q", split="meta_llama3_8b")
 ```
-Remember that split names are sanitized (`/` and `-` become `_`). Inspect `ds_builder.config_names` or the README front matter to see what configs exist.
 
 ## Extending to New Models
-1. Copy the relevant `transformers` module into `models/<model_name>/modeling_<model_name>.py`.
-2. Import `compute_positions` + `get_active_sniffer` and wrap the attention block as shown above.
-3. (Optional) store per-layer metadata (e.g., sliding window) on the module so you can pass it into `sniffer.capture`.
-4. Run `pytest tests/test_models.py -k patch_modeling_modules` to ensure the aliasing still succeeds.
-5. Execute your capture job; `patch_modeling_modules()` will map `transformers.models.<model_name>` to your local implementation automatically.
+1. Copy the upstream `transformers` module into `models/<model_name>/modeling_<model_name>.py`.
+2. Import `compute_positions` and `get_active_sniffer` and call `sniffer.capture` inside the attention block (pass layer/head indices plus optional sliding-window size).
+3. Run `pytest tests/test_models.py -k patch_modeling_modules` (or your custom test) to ensure the aliasing still works.
+4. Include the new `model.name` in your YAML and run the CLI.
 
 ## Testing & Troubleshooting
-- Run `pytest` (preferred) or narrow scopes like `pytest tests/test_sniffer.py -k sampler`.
-- If `ModuleNotFoundError: transformers.models.foo` appears, confirm you ran `pip install -e .` (so the `models` package is importable) or call `sniff.patch_modeling_modules(root=Path("path/to/models"))` before importing transformers modules.
-- `LogUniformSampler` is stochastic per token but deterministic per seed; if you expect denser sampling, raise `capture.sampler.base_rate`.
-- When pushing to the Hub, the CLI overwrites the dataset repo contents. Use a scratch repo or branch if you want to keep older captures.
-
-That’s it—create your config, run `sniff-qk`, and explore the captured attention vectors directly from Hugging Face datasets.
+- Run `pytest` (full suite) or scoped commands like `pytest tests/test_sniffer.py -k sampler`.
+- If `transformers.models.<name>` fails to import, ensure `pip install -e .` has been run and `patch_modeling_modules()` executes before loading the model.
+- If Hub pushes fail, verify you set `HF_TOKEN` (write access) and that `hf_repo_id` exists.
+- Raise `capture.sampler.base_rate` if captures are too sparse; decrease `min_bucket_size` (power-of-two rounded) to bias toward early tokens.

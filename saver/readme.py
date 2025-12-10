@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Union
@@ -58,7 +59,11 @@ class DatasetReadme:
         for section_name in SECTION_DEFS:
             body = self._ensure_section(body, section_name)
 
-        body = self._replace_section(body, "models", self._render_models_section(models, model_metadata, bucket_counts))
+        body = self._replace_section(
+            body,
+            "models",
+            self._render_models_section(models, model_metadata, bucket_counts, config_splits),
+        )
         body = self._replace_section(body, "columns", self._render_columns_section())
         body = self._replace_section(body, "loading", self._render_loading_section())
 
@@ -217,9 +222,11 @@ class DatasetReadme:
         models: Set[str],
         metadata: Dict[str, Dict[str, Union[str, int, float]]],
         bucket_counts: Dict[str, Counter],
+        config_splits: Dict[str, Set[str]],
     ) -> str:
         if not models:
             return "- (no captures yet)"
+        model_stats = self._model_capture_stats(config_splits)
         lines = []
         for model in sorted(models):
             lines.append(f"- [{model}](https://huggingface.co/{model})")
@@ -227,6 +234,12 @@ class DatasetReadme:
             source = info.get("source_dataset", "unknown")
             split = info.get("dataset_split", "unknown")
             lines.append(f"  - dataset: {source} (split: {split})")
+            sanitized_split = info.get("sanitized_split") or _sanitize_split_name(model)
+            lines.append(f"  - split: `{sanitized_split}` (use as split when loading)")
+            coverage = model_stats.get(sanitized_split, {"layer_count": 0, "query_heads": 0, "key_heads": 0})
+            lines.append(f"  - layers: {coverage['layer_count']}")
+            lines.append(f"  - query heads: {coverage['query_heads']}")
+            lines.append(f"  - key heads: {coverage['key_heads']}")
             counts = bucket_counts.get(model, Counter())
             if counts:
                 bucket_str = ", ".join(f"b{bucket}={counts[bucket]}" for bucket in sorted(counts))
@@ -235,9 +248,40 @@ class DatasetReadme:
             lines.append(f"  - buckets: {bucket_str}")
         return "\n".join(lines)
 
+    def _model_capture_stats(self, config_splits: Dict[str, Set[str]]) -> Dict[str, Dict[str, int]]:
+        stats: Dict[str, Dict[str, Set]] = {}
+        for config_name, splits in config_splits.items():
+            parsed = self._parse_head_config(config_name)
+            if not parsed:
+                continue
+            layer, head, kind = parsed
+            for split in splits:
+                entry = stats.setdefault(
+                    split,
+                    {"layers": set(), "q_heads": set(), "k_heads": set()},
+                )
+                entry["layers"].add(layer)
+                if kind == "q":
+                    entry["q_heads"].add((layer, head))
+                else:
+                    entry["k_heads"].add((layer, head))
+        coverage: Dict[str, Dict[str, int]] = {}
+        for split, entry in stats.items():
+            coverage[split] = {
+                "layer_count": len(entry["layers"]),
+                "query_heads": len(entry["q_heads"]),
+                "key_heads": len(entry["k_heads"]),
+            }
+        return coverage
+
     def _render_columns_section(self) -> str:
         rows = [
-            ("bucket", "Log2 bucket identifier used for sampling (lower buckets capture earlier positions)."),
+            (
+                "bucket",
+                "Base-2 exponent `i` used for sampling. Bucket `b{i}` corresponds to the canonical "
+                "`[2^i, 2^{i+1})` span; exponents below the configured minimum collapse into "
+                "`ceil(log2(effective_min))` so the first bucket always covers at least that many tokens.",
+            ),
             ("example_id", "Index of the example within the batch when the vector was captured."),
             ("position", "Token position within the example's sequence (0-indexed)."),
             ("vector", "Float32 tensor containing the query or key vector; the config name encodes which."),
@@ -339,3 +383,10 @@ class DatasetReadme:
             return layer, head, kind
         except ValueError:
             return None
+
+
+def _sanitize_split_name(model: str) -> str:
+    return _SPLIT_SANITIZE_RE.sub("_", model)
+
+
+_SPLIT_SANITIZE_RE = re.compile(r"\W")
