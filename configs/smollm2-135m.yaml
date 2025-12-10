@@ -32,6 +32,6 @@ capture:
     base_rate: 3.0
 
 output:
-  data_root: data/sniffed-qk
+  data_root: data/sniffed-qk-smollm2-135m
   readme_path: README.md
   hf_repo_id: viktoroo/sniffed-qk-smollm2-135m

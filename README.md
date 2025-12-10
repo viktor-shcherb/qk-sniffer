@@ -47,7 +47,7 @@
    # or
    PYTHONPATH=. python sniff.py --config configs/sample_sniff.yaml
    ```
-   The CLI patches local modeling files into `transformers`, downloads the latest dataset snapshot (if `hf_repo_id` is set), runs inference, writes captures to a staging directory, refreshes the local dataset from the Hub again, replays the new rows on top, then uploads the result.
+   The CLI patches local modeling files into `transformers`, downloads the latest dataset snapshot (if `hf_repo_id` is set), runs inference, writes captures to a staging directory, refreshes the local dataset from the Hub again, replays the new rows directly into the synced copy, then uploads the result.
 
 ## Key Configuration Notes
 - `dataset.*` maps directly to `datasets.load_dataset`. Set `max_samples` for dry runs.
@@ -58,7 +58,7 @@
   - `sampler.type` controls the bucket definition automatically: `log_uniform` samples uniformly *within* each log bucket, while `uniform` samples uniformly over every fixed-width bucket. Both are deterministic per `(example, layer, head, kind)`.
 - `output.*`
   - `data_root` is both your working directory and (optionally) the local clone of `hf_repo_id`.
-  - `sniff.py` writes staged captures to a temp folder, then re-pulls `hf_repo_id` before merging so concurrent remote updates win.
+  - The CLI now maintains `data_root/final` (the synced dataset) and `data_root/staging` (the working tree). It pulls the repo into `final`, records new captures under `staging`, re-pulls `final`, then replays the staged Parquet shards (and README metadata) directly into `final` so only the touched files change before pushing.
 
 ## Capture Output & Dataset Layout
 - Each `(model split, layer, head, vector_kind)` writes to `data/<sanitized_model>/<lXXhYY{q|k}>/data.parquet`. Splits sanitize `[\W]` → `_` (e.g., `meta/llama3-8b` → `meta_llama3_8b`).
@@ -66,13 +66,13 @@
 - The saver rewrites `output.readme_path` with Hugging Face front matter listing every config plus aggregate helpers such as `all`, `layer00`, `all_q`, etc., so `datasets.load_dataset` can point at the folder or Hub repo immediately.
 - Columns:
 
-  | Column | Description |
-  | --- | --- |
-| `bucket` | Identifier of the bucket the token fell into. `log_uniform` stores the exponent `i` (clamped upward so the first bucket spans ≥ `min_bucket_size`), meaning bucket `b{i}` maps to `[2^i, 2^{i+1})`. `uniform` stores `floor(position / min_bucket_size)` so every bucket covers exactly `min_bucket_size` tokens (last bucket may be smaller). |
-  | `example_id` | Batch ID from `set_active_example_ids` (or the implicit index). |
-  | `position` | Token index after any cache offset. |
-  | `vector` | Float32 list representing the captured query/key vector. |
-  | `sliding_window` | Sliding-window size for local attention layers (`null` for full causal). |
+  | Column           | Description                                                                                                                                                                                                                                                                                                                                    |
+  |------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| | `bucket`         | Identifier of the bucket the token fell into. `log_uniform` stores the exponent `i` (clamped upward so the first bucket spans ≥ `min_bucket_size`), meaning bucket `b{i}` maps to `[2^i, 2^{i+1})`. `uniform` stores `floor(position / min_bucket_size)` so every bucket covers exactly `min_bucket_size` tokens (last bucket may be smaller). |
+  | `example_id`     | Batch ID from `set_active_example_ids` (or the implicit index).                                                                                                                                                                                                                                                                                |
+  | `position`       | Token index after any cache offset.                                                                                                                                                                                                                                                                                                            |
+  | `vector`         | Float32 list representing the captured query/key vector.                                                                                                                                                                                                                                                                                       |
+  | `sliding_window` | Sliding-window size for local attention layers (`null` for full causal).                                                                                                                                                                                                                                                                       |
 
 Loading example:
 ```python

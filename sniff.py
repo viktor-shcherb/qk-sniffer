@@ -4,7 +4,7 @@ import argparse
 import importlib
 import sys
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import re
 import shutil
 import tempfile
@@ -295,18 +295,30 @@ def patch_modeling_modules(root: Path = Path("models")) -> None:
 def pull_remote_dataset(settings: OutputSettings) -> None:
     if not settings.hf_repo_id:
         return
+    target_root = Path(settings.data_root)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="sniff-pull-"))
     try:
         snapshot_download(
             repo_id=settings.hf_repo_id,
             repo_type="dataset",
-            local_dir=settings.data_root,
+            local_dir=str(tmp_dir),
+            local_dir_use_symlinks=False,
             force_download=True,
             token=True,
         )
+        repo_root = tmp_dir
+        children = list(tmp_dir.iterdir())
+        if len(children) == 1 and children[0].is_dir():
+            repo_root = children[0]
+        if target_root.exists():
+            shutil.rmtree(target_root)
+        shutil.move(str(repo_root), str(target_root))
     except RepositoryNotFoundError:
         print(f"[sniff] Dataset repo {settings.hf_repo_id} not found; skipping pull.")
     except HfHubHTTPError as err:
         print(f"[sniff] Failed to pull dataset repo {settings.hf_repo_id}: {err}")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def push_remote_dataset(settings: OutputSettings) -> None:
@@ -333,11 +345,18 @@ def push_remote_dataset(settings: OutputSettings) -> None:
 
 def run_inference(config: SniffConfig) -> None:
     patch_modeling_modules()
-    pull_remote_dataset(config.output)
+    base_root = Path(config.output.data_root)
+    final_root = base_root / "final"
+    staging_root = base_root / "staging"
+    final_output = replace(config.output, data_root=str(final_root))
+    staging_output = replace(config.output, data_root=str(staging_root))
+    pull_remote_dataset(final_output)
+    if staging_root.exists():
+        shutil.rmtree(staging_root)
+    staging_root.mkdir(parents=True, exist_ok=True)
     dataset = load_hf_dataset(config.dataset)
     tokenizer = prepare_tokenizer(config.tokenizer, config.model.name)
-    staging_root = Path(tempfile.mkdtemp(prefix="sniff-staging-"))
-    staging_readme = staging_root / "README.md"
+    staging_readme = resolve_readme_path(staging_output)
 
     torch_dtype = resolve_dtype(config.model.dtype)
     model = AutoModelForCausalLM.from_pretrained(
@@ -410,11 +429,8 @@ def run_inference(config: SniffConfig) -> None:
                 progress.update(len(texts))
     finally:
         progress.close()
-    try:
-        finalize_capture(config, staging_root)
-    finally:
-        shutil.rmtree(staging_root, ignore_errors=True)
-    push_remote_dataset(config.output)
+    finalize_capture(config, staging_root, final_output)
+    push_remote_dataset(final_output)
 
 
 def _sanitize_split_name(name: str) -> str:
@@ -501,7 +517,11 @@ def _read_existing_config_rows(root: Path, model_name: str, config_name: str) ->
     data_path = config_dir / "data.parquet"
     if not data_path.exists():
         return []
-    table = pq.read_table(data_path)
+    try:
+        table = pq.read_table(data_path)
+    except Exception as err:
+        print(f"[sniff] Skipping existing data for {model_name}/{config_name}: {err}")
+        return []
     if table.num_rows == 0:
         return []
     return _rows_from_table(
@@ -513,41 +533,48 @@ def _read_existing_config_rows(root: Path, model_name: str, config_name: str) ->
     )
 
 
-def finalize_capture(config: SniffConfig, staging_root: Path) -> None:
+def finalize_capture(
+    config: SniffConfig,
+    staging_root: Path,
+    final_output: OutputSettings,
+) -> None:
     staging_path = Path(staging_root)
-    pull_remote_dataset(config.output)
-    if not staging_path.exists():
-        return
+    final_path = Path(final_output.data_root)
+    sanitized_split = _sanitize_split_name(config.model.name)
     staging_rows = _collect_rows_by_config(staging_path, config.model.name)
-    output_root = Path(config.output.data_root)
-    output_root.mkdir(parents=True, exist_ok=True)
-    if not staging_rows:
-        return
-    saver = DatasetSaver(
-        root=output_root,
-        readme_path=resolve_readme_path(config.output),
-        write_batch_size=config.output.write_batch_size,
-    )
-    saver.register_model_metadata(
-        config.model.name,
-        {
-            "source_dataset": config.dataset.path,
-            "dataset_name": config.dataset.name or "",
-            "dataset_split": config.dataset.split,
-        },
-    )
-    sanitized = _sanitize_split_name(config.model.name)
-    for config_name, rows in staging_rows.items():
-        existing_rows = _read_existing_config_rows(output_root, config.model.name, config_name)
-        config_dir = output_root / sanitized / config_name
-        data_file = config_dir / "data.parquet"
-        if data_file.exists():
-            data_file.unlink()
-        config_dir.mkdir(parents=True, exist_ok=True)
-        combined_rows = existing_rows + rows
-        if combined_rows:
-            saver.add_many(combined_rows)
-    saver.close()
+    pull_remote_dataset(final_output)
+
+    if staging_rows:
+        existing_rows: Dict[str, List[CaptureRow]] = {}
+        for config_name in staging_rows:
+            rows = _read_existing_config_rows(final_path, config.model.name, config_name)
+            if rows:
+                existing_rows[config_name] = rows
+        model_split_dir = final_path / sanitized_split
+        if model_split_dir.exists():
+            shutil.rmtree(model_split_dir)
+        saver = DatasetSaver(
+            root=final_path,
+            readme_path=resolve_readme_path(final_output),
+            write_batch_size=config.output.write_batch_size,
+        )
+        saver.register_model_metadata(
+            config.model.name,
+            {
+                "source_dataset": config.dataset.path,
+                "dataset_name": config.dataset.name or "",
+                "dataset_split": config.dataset.split,
+            },
+        )
+        for config_name in sorted(staging_rows):
+            combined = existing_rows.get(config_name, []) + staging_rows[config_name]
+            if combined:
+                saver.add_many(combined)
+        saver.close()
+
+    if staging_path.exists():
+        shutil.rmtree(staging_path)
+    staging_path.mkdir(parents=True, exist_ok=True)
 
 
 def main():
