@@ -301,6 +301,7 @@ def pull_remote_dataset(settings: OutputSettings) -> None:
             repo_type="dataset",
             local_dir=settings.data_root,
             force_download=True,
+            token=True,
         )
     except RepositoryNotFoundError:
         print(f"[sniff] Dataset repo {settings.hf_repo_id} not found; skipping pull.")
