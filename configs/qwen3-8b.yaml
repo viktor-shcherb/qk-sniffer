@@ -28,7 +28,7 @@ capture:
   heads: null
   min_bucket_size: 2048
   sampler:
-    type: log_uniform
+    type: uniform
     base_rate: 3.0
 
 output:
