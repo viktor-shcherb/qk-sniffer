@@ -232,6 +232,15 @@ def test_finalize_capture_preserves_other_splits_and_readme(tmp_path, monkeypatc
     assert f"{sanitized}/l00h*/*.parquet" in paths
     assert all(not path.startswith("data/") for path in paths)
 
+    repo_readme_path = base_root / "README.md"
+    assert repo_readme_path.exists()
+    repo_parts = repo_readme_path.read_text(encoding="utf-8").split("---", 2)
+    assert len(repo_parts) >= 3
+    repo_front = yaml.safe_load(repo_parts[1]) or {}
+    repo_layer_entry = next(entry for entry in repo_front.get("configs", []) if entry["config_name"] == "layer00")
+    repo_paths = {item["path"] for item in repo_layer_entry["data_files"]}
+    assert any(path.startswith("final/") for path in repo_paths)
+
 
 def test_finalize_capture_keeps_existing_configs(tmp_path, monkeypatch):
     remote_repo = tmp_path / "remote_repo"

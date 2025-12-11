@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import sys
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
@@ -116,6 +117,7 @@ DTYPE_ALIASES = {
 
 _CONFIG_NAME_RE = re.compile(r"^l(\d{2})h(\d{2})([qk])$")
 _SPLIT_SANITIZE_RE = re.compile(r"\W")
+_SNAPSHOT_STATE_FILENAME = ".sniff_snapshot.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -149,6 +151,13 @@ def resolve_readme_path(settings: OutputSettings) -> Path:
     if readme_path.is_absolute():
         return readme_path
     return Path(settings.data_root) / readme_path
+
+
+def _absolute_path(path: Path) -> Path:
+    expanded = path.expanduser()
+    if expanded.is_absolute():
+        return expanded
+    return (Path.cwd() / expanded).resolve()
 
 
 def load_hf_dataset(settings: DatasetSettings) -> Dataset:
@@ -303,6 +312,36 @@ def patch_modeling_modules(root: Path = Path("models")) -> None:
             sys.path.remove(import_root)
         except ValueError:
             pass
+
+
+def _snapshot_state_path(data_root: Path) -> Path:
+    return Path(data_root) / _SNAPSHOT_STATE_FILENAME
+
+
+def _load_snapshot_state(data_root: Path) -> Optional[Dict[str, str]]:
+    path = _snapshot_state_path(data_root)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _write_snapshot_state(data_root: Path, repo_id: str, sha: Optional[str]) -> None:
+    path = _snapshot_state_path(data_root)
+    if not sha:
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        return
+    payload = {"repo_id": repo_id, "sha": sha}
+    try:
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        pass
         if clear_models_namespace:
             for name in list(sys.modules):
                 if name == "models" or name.startswith("models."):
@@ -314,15 +353,37 @@ def pull_remote_dataset(settings: OutputSettings) -> None:
     if not settings.hf_repo_id:
         return
     target_root = Path(settings.data_root)
+    api = HfApi()
+    repo_sha: Optional[str] = None
+    try:
+        repo_info = api.repo_info(settings.hf_repo_id, repo_type="dataset")
+        repo_sha = getattr(repo_info, "sha", None)
+    except RepositoryNotFoundError:
+        print(f"[sniff] Dataset repo {settings.hf_repo_id} not found; skipping pull.")
+        _write_snapshot_state(target_root, settings.hf_repo_id, None)
+        return
+    except HfHubHTTPError as err:
+        print(f"[sniff] Failed to query dataset repo {settings.hf_repo_id}: {err}")
+        return
+    state = _load_snapshot_state(target_root)
+    if (
+        repo_sha
+        and state
+        and state.get("repo_id") == settings.hf_repo_id
+        and state.get("sha") == repo_sha
+        and target_root.exists()
+    ):
+        print(f"[sniff] Dataset {settings.hf_repo_id} already synced at {repo_sha}; skipping pull.")
+        return
     tmp_dir = Path(tempfile.mkdtemp(prefix="sniff-pull-"))
     try:
         snapshot_download(
             repo_id=settings.hf_repo_id,
             repo_type="dataset",
             local_dir=str(tmp_dir),
-            local_dir_use_symlinks=False,
             force_download=True,
             token=True,
+            revision=repo_sha,
         )
         repo_root = tmp_dir
         children = list(tmp_dir.iterdir())
@@ -331,8 +392,11 @@ def pull_remote_dataset(settings: OutputSettings) -> None:
         if target_root.exists():
             shutil.rmtree(target_root)
         shutil.move(str(repo_root), str(target_root))
+        if repo_sha:
+            _write_snapshot_state(target_root, settings.hf_repo_id, repo_sha)
     except RepositoryNotFoundError:
         print(f"[sniff] Dataset repo {settings.hf_repo_id} not found; skipping pull.")
+        _write_snapshot_state(target_root, settings.hf_repo_id, None)
     except HfHubHTTPError as err:
         print(f"[sniff] Failed to pull dataset repo {settings.hf_repo_id}: {err}")
     finally:
@@ -355,6 +419,13 @@ def push_remote_dataset(settings: OutputSettings) -> None:
             repo_type="dataset",
             commit_message="Update dataset",
         )
+        try:
+            repo_info = api.repo_info(settings.hf_repo_id, repo_type="dataset")
+            sha = getattr(repo_info, "sha", None)
+            if sha:
+                _write_snapshot_state(Path(settings.data_root), settings.hf_repo_id, sha)
+        except HfHubHTTPError:
+            pass
     except RepositoryNotFoundError:
         print(f"[sniff] Dataset repo {settings.hf_repo_id} not found; please create it before pushing.")
     except HfHubHTTPError as err:
@@ -571,10 +642,16 @@ def finalize_capture(
             config_dir = final_path / sanitized_split / config_name
             if config_dir.exists():
                 shutil.rmtree(config_dir)
+        primary_readme = _absolute_path(resolve_readme_path(config.output))
+        final_readme = _absolute_path(resolve_readme_path(final_output))
+        mirror_paths: List[Path] = []
+        if final_readme != primary_readme:
+            mirror_paths.append(final_readme)
         saver = DatasetSaver(
             root=final_path,
-            readme_path=resolve_readme_path(final_output),
+            readme_path=primary_readme,
             write_batch_size=config.output.write_batch_size,
+            mirror_readme_paths=mirror_paths or None,
         )
         saver.register_model_metadata(
             config.model.name,

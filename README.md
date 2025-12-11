@@ -59,6 +59,7 @@
 - `output.*`
   - `data_root` is both your working directory and (optionally) the local clone of `hf_repo_id`.
   - The CLI now maintains `data_root/final` (the synced dataset) and `data_root/staging` (the working tree). It pulls the repo into `final`, records new captures under `staging`, re-pulls `final`, then replays the staged Parquet shards (and README metadata) directly into `final` so only the touched files change before pushing.
+  - `readme_path` always points to the repo root copy (e.g., `data/sniffed-qk-qwen3-8b/README.md`). The CLI mirrors that README into `data_root/final` automatically before uploading so the Hugging Face repo keeps its top-level README while final metadata stays in sync.
 
 ## Capture Output & Dataset Layout
 - Each `(model split, layer, head, vector_kind)` writes to `data/<sanitized_model>/<lXXhYY{q|k}>/data.parquet`. Splits sanitize `[\W]` → `_` (e.g., `meta/llama3-8b` → `meta_llama3_8b`).

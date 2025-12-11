@@ -129,16 +129,29 @@ class DatasetSaver:
         readme_path: Union[str, Path] = "README.md",
         dataset_name: str = "viktoroo/sniffed-qk",
         write_batch_size: int = 2048,
+        mirror_readme_paths: Optional[Sequence[Union[str, Path]]] = None,
     ):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.compression = compression
-        raw_readme_path = Path(readme_path)
+        raw_readme_path = Path(readme_path).expanduser()
         if raw_readme_path.is_absolute():
             resolved_readme_path = raw_readme_path
         else:
-            resolved_readme_path = self.root / raw_readme_path
+            resolved_readme_path = (self.root / raw_readme_path).expanduser()
         self.readme_path = resolved_readme_path
+        seen_readme_paths = {self.readme_path.resolve()}
+        mirror_readmes: List[DatasetReadme] = []
+        for extra_path in mirror_readme_paths or []:
+            extra = Path(extra_path).expanduser()
+            if not extra.is_absolute():
+                extra = (self.root / extra).expanduser()
+            resolved_extra = extra.resolve()
+            if resolved_extra in seen_readme_paths:
+                continue
+            mirror_readmes.append(DatasetReadme(resolved_extra, self.root, dataset_name))
+            seen_readme_paths.add(resolved_extra)
+        self._mirror_readmes = mirror_readmes
         self._sinks: Dict[Tuple[str, str], _ParquetSink] = {}
         self._config_splits: Dict[str, Set[str]] = {}
         self._models: Set[str] = set()
@@ -288,6 +301,8 @@ class DatasetSaver:
 
     def _write_readme(self) -> None:
         self._readme.write(self._config_splits, self._models, self._model_metadata, self._bucket_counts)
+        for mirror in self._mirror_readmes:
+            mirror.write(self._config_splits, self._models, self._model_metadata, self._bucket_counts)
 
     def _seed_existing_entries(self) -> None:
         front_matter = self._readme.front_matter or {}

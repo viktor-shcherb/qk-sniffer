@@ -48,7 +48,11 @@ class DatasetReadme:
         if readme_dir == data_root_resolved:
             prefix = ""
         else:
-            prefix = str(data_root_resolved)
+            try:
+                prefix_candidate = os.path.relpath(data_root_resolved, readme_dir)
+            except ValueError:
+                prefix_candidate = str(data_root_resolved)
+            prefix = "" if prefix_candidate == "." else prefix_candidate
         prefix = prefix.replace(os.sep, "/")
         self._data_prefix = prefix
 

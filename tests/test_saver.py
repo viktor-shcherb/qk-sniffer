@@ -140,6 +140,33 @@ def test_relative_readme_path_is_saved_inside_data_root(tmp_path):
     assert not (tmp_path / "README.md").exists()
 
 
+def test_dataset_saver_mirrors_readme_paths(tmp_path):
+    repo_root = tmp_path / "repo"
+    final_root = repo_root / "final"
+    final_root.mkdir(parents=True)
+    primary_readme = repo_root / "README.md"
+    mirror_readme = final_root / "README.md"
+
+    saver = DatasetSaver(
+        root=final_root,
+        readme_path=primary_readme,
+        mirror_readme_paths=[mirror_readme],
+        dataset_name="dummy/repo",
+    )
+    saver.add(_row("meta/llama3-8b", layer=0, head=0, kind="q", bucket=0, example_id=0, position=0, vector=[0.1]))
+    saver.close()
+
+    assert primary_readme.exists()
+    assert mirror_readme.exists()
+
+    primary_front, _ = _read_readme(primary_readme)
+    mirror_front, _ = _read_readme(mirror_readme)
+    primary_layer = next(entry for entry in primary_front["configs"] if entry["config_name"] == "l00h00q")
+    mirror_layer = next(entry for entry in mirror_front["configs"] if entry["config_name"] == "l00h00q")
+    assert primary_layer["data_files"][0]["path"].startswith("final/")
+    assert not mirror_layer["data_files"][0]["path"].startswith("final/")
+
+
 def test_dataset_saver_preserves_model_stats_across_runs(tmp_path):
     root = tmp_path / "data"
     readme = tmp_path / "README.md"
@@ -210,22 +237,23 @@ def test_hf_datasets_e2e_load(tmp_path):
     )
     saver.close()
 
-    front_matter, _ = _read_readme(tmp_path / "README.md")
+    readme_path = tmp_path / "README.md"
+    front_matter, _ = _read_readme(readme_path)
     configs = {entry["config_name"]: entry for entry in front_matter["configs"]}
 
     q_entry = configs["l00h00q"]
-    q_data_files = _abs_paths(q_entry["data_files"])
+    q_data_files = _abs_paths(q_entry["data_files"], base_dir=readme_path.parent)
     q_dataset = load_dataset("parquet", data_files=q_data_files, split="meta_llama3_8b")
     assert q_dataset.num_rows == 1
     assert q_dataset[0]["bucket"] == 0
 
     layer_entry = configs["layer00"]
-    layer_data_files = _abs_paths(layer_entry["data_files"])
+    layer_data_files = _abs_paths(layer_entry["data_files"], base_dir=readme_path.parent)
     layer_dataset = load_dataset("parquet", data_files=layer_data_files, split="meta_llama3_8b")
     assert layer_dataset.num_rows == 2  # q + k samples
 
     all_q_entry = configs["all_q"]
-    all_q_files = _abs_paths(all_q_entry["data_files"])
+    all_q_files = _abs_paths(all_q_entry["data_files"], base_dir=readme_path.parent)
     gemma_dataset = load_dataset("parquet", data_files=all_q_files, split="google_gemma3_9b")
     assert gemma_dataset.num_rows == 1
     assert gemma_dataset[0]["position"] == 2
@@ -262,9 +290,13 @@ def _read_readme(path: Path) -> tuple[dict, str]:
     return front, body
 
 
-def _abs_paths(data_files: list[dict]) -> dict:
+def _abs_paths(data_files: list[dict], *, base_dir: Path) -> dict:
     result = {}
     for item in data_files:
         path = Path(item["path"])
-        result[item["split"]] = str(path.resolve())
+        if not path.is_absolute():
+            path = (base_dir / path).resolve()
+        else:
+            path = path.resolve()
+        result[item["split"]] = str(path)
     return result
