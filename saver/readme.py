@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -42,6 +43,14 @@ class DatasetReadme:
         self.data_root = Path(data_root)
         self.dataset_name = dataset_name
         self.front_matter, self.body = self._load_existing()
+        readme_dir = (self.path.parent or Path(".")).resolve()
+        data_root_resolved = self.data_root.resolve()
+        if readme_dir == data_root_resolved:
+            prefix = ""
+        else:
+            prefix = str(data_root_resolved)
+        prefix = prefix.replace(os.sep, "/")
+        self._data_prefix = prefix
 
     def write(
         self,
@@ -99,7 +108,7 @@ class DatasetReadme:
                 self._make_entry(
                     "all",
                     metadata["all_splits"],
-                    lambda split: f"{self.data_root.as_posix()}/{split}/*/*.parquet",
+                    lambda split: self._data_path(split, "*/*.parquet"),
                     default=True,
                     require_splits=False,
                 )
@@ -109,7 +118,7 @@ class DatasetReadme:
                 self._make_entry(
                     f"layer{layer:02d}",
                     metadata["layer_splits"][layer],
-                    lambda split, layer=layer: f"{self.data_root.as_posix()}/{split}/l{layer:02d}h*/*.parquet",
+                    lambda split, layer=layer: self._data_path(split, f"l{layer:02d}h*/*.parquet"),
                 )
             )
         for layer, head in sorted(metadata["head_splits"]):
@@ -117,9 +126,7 @@ class DatasetReadme:
                 self._make_entry(
                     f"l{layer:02d}h{head:02d}",
                     metadata["head_splits"][(layer, head)],
-                    lambda split, layer=layer, head=head: (
-                        f"{self.data_root.as_posix()}/{split}/l{layer:02d}h{head:02d}*/*.parquet"
-                    ),
+                    lambda split, layer=layer, head=head: self._data_path(split, f"l{layer:02d}h{head:02d}*/*.parquet"),
                 )
             )
 
@@ -128,7 +135,7 @@ class DatasetReadme:
                 self._make_entry(
                     "all_q",
                     metadata["kind_splits"]["q"],
-                    lambda split: f"{self.data_root.as_posix()}/{split}/*q/*.parquet",
+                    lambda split: self._data_path(split, "*q/*.parquet"),
                 )
             )
         for layer in sorted(metadata["layer_kind_splits"]["q"]):
@@ -136,7 +143,7 @@ class DatasetReadme:
                 self._make_entry(
                     f"layer{layer:02d}_q",
                     metadata["layer_kind_splits"]["q"][layer],
-                    lambda split, layer=layer: f"{self.data_root.as_posix()}/{split}/l{layer:02d}h*q/*.parquet",
+                    lambda split, layer=layer: self._data_path(split, f"l{layer:02d}h*q/*.parquet"),
                 )
             )
         entries.extend(self._build_kind_head_entries(config_splits, "q"))
@@ -146,7 +153,7 @@ class DatasetReadme:
                 self._make_entry(
                     "all_k",
                     metadata["kind_splits"]["k"],
-                    lambda split: f"{self.data_root.as_posix()}/{split}/*k/*.parquet",
+                    lambda split: self._data_path(split, "*k/*.parquet"),
                 )
             )
         for layer in sorted(metadata["layer_kind_splits"]["k"]):
@@ -154,7 +161,7 @@ class DatasetReadme:
                 self._make_entry(
                     f"layer{layer:02d}_k",
                     metadata["layer_kind_splits"]["k"][layer],
-                    lambda split, layer=layer: f"{self.data_root.as_posix()}/{split}/l{layer:02d}h*k/*.parquet",
+                    lambda split, layer=layer: self._data_path(split, f"l{layer:02d}h*k/*.parquet"),
                 )
             )
         entries.extend(self._build_kind_head_entries(config_splits, "k"))
@@ -365,7 +372,7 @@ class DatasetReadme:
             if not splits:
                 continue
             data_files = [
-                {"split": split, "path": f"{self.data_root.as_posix()}/{split}/{config_name}/*.parquet"}
+                {"split": split, "path": self._data_path(split, f"{config_name}/*.parquet")}
                 for split in sorted(splits)
             ]
             entries.append({"config_name": config_name, "data_files": data_files})
@@ -389,6 +396,18 @@ class DatasetReadme:
         if default:
             entry["default"] = True
         return entry
+    def _data_path(self, split: str, suffix: str) -> str:
+        parts: List[str] = []
+        prefix = self._data_prefix.rstrip("/")
+        if prefix:
+            parts.append(prefix)
+        split_part = split.strip("/")
+        if split_part:
+            parts.append(split_part)
+        suffix_part = suffix.lstrip("/")
+        if suffix_part:
+            parts.append(suffix_part)
+        return "/".join(parts)
 
     def _parse_head_config(self, config_name: str) -> Optional[Tuple[int, int, str]]:
         if len(config_name) != 7 or not (config_name.startswith("l") and config_name[3] == "h"):

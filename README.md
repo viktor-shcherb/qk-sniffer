@@ -1,6 +1,6 @@
 # qk-sniffer
 
-`qk-sniffer` instruments Hugging Face transformer models so each attention layer can stream sampled key/query vectors into Parquet shards that mirror Hugging Face dataset repos. It ships with Gemma 3/Llama hooks, a deterministic sampler, and a CLI (`sniff-qk`) that can pull/push full datasets from the Hub.
+`qk-sniffer` instruments Hugging Face transformer models so each attention layer can stream sampled key/query vectors into Parquet shards that mirror Hugging Face dataset repos. It ships with Gemma 3/Llama/Qwen 3 hooks, a deterministic sampler, and a CLI (`sniff-qk`) that can pull/push full datasets from the Hub.
 
 ## Requirements & Installation
 - Python 3.9+, recent PyTorch build matching your hardware.
@@ -13,7 +13,7 @@
 - Put secrets (e.g., `HF_TOKEN`) in a `.env`; `python-dotenv` loads them automatically.
 
 ## Quick Start
-1. **Instrument the model (if needed).** Copy the relevant `transformers` module into `models/<name>/modeling_<name>.py`, import `get_active_sniffer`/`compute_positions`, and call `sniffer.capture(...)` inside the attention block. Gemma 3 + Llama are already wired up.
+1. **Instrument the model (if needed).** Copy the relevant `transformers` module into `models/<name>/modeling_<name>.py`, import `get_active_sniffer`/`compute_positions`, and call `sniffer.capture(...)` inside the attention block. Gemma 3, Llama, and Qwen 3 are already wired up.
 2. **Create a config** (adapt the sample below):
    ```yaml
    dataset:

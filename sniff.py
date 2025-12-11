@@ -259,6 +259,13 @@ def patch_modeling_modules(root: Path = Path("models")) -> None:
     if not root.exists():
         return
     root = root.resolve()
+    default_models_root = (Path(__file__).parent / "models").resolve()
+    clear_models_namespace = root != default_models_root
+    saved_model_modules: Dict[str, ModuleType] = {}
+    if clear_models_namespace:
+        for name in list(sys.modules):
+            if name == "models" or name.startswith("models."):
+                saved_model_modules[name] = sys.modules.pop(name)
     import_root = str(root.parent)
     sys.path.insert(0, import_root)
     try:
@@ -275,21 +282,32 @@ def patch_modeling_modules(root: Path = Path("models")) -> None:
                 if _module_exists(target_package):
                     # Avoid clobbering upstream packages (e.g., transformers.models.llama).
                     continue
+            module = None
+            completed_depth = 0
             for depth in range(1, len(rel_parts) + 1):
                 local_name = ".".join(["models", *rel_parts[:depth]])
                 target_name = ".".join(["transformers", "models", *rel_parts[:depth]])
                 try:
                     module = importlib.import_module(local_name)
+                    completed_depth = depth
                 except ImportError:
                     # If a local module fails to import, bail on deeper descendants.
+                    module = None
                     break
-            replace = depth == len(rel_parts)
+            if module is None:
+                continue
+            replace = completed_depth == len(rel_parts)
             _alias_module(module, target_name, replace_existing=replace)
     finally:
         try:
             sys.path.remove(import_root)
         except ValueError:
             pass
+        if clear_models_namespace:
+            for name in list(sys.modules):
+                if name == "models" or name.startswith("models."):
+                    sys.modules.pop(name, None)
+            sys.modules.update(saved_model_modules)
 
 
 def pull_remote_dataset(settings: OutputSettings) -> None:
@@ -540,19 +558,19 @@ def finalize_capture(
 ) -> None:
     staging_path = Path(staging_root)
     final_path = Path(final_output.data_root)
-    sanitized_split = _sanitize_split_name(config.model.name)
     staging_rows = _collect_rows_by_config(staging_path, config.model.name)
     pull_remote_dataset(final_output)
 
     if staging_rows:
+        sanitized_split = _sanitize_split_name(config.model.name)
         existing_rows: Dict[str, List[CaptureRow]] = {}
         for config_name in staging_rows:
             rows = _read_existing_config_rows(final_path, config.model.name, config_name)
             if rows:
                 existing_rows[config_name] = rows
-        model_split_dir = final_path / sanitized_split
-        if model_split_dir.exists():
-            shutil.rmtree(model_split_dir)
+            config_dir = final_path / sanitized_split / config_name
+            if config_dir.exists():
+                shutil.rmtree(config_dir)
         saver = DatasetSaver(
             root=final_path,
             readme_path=resolve_readme_path(final_output),

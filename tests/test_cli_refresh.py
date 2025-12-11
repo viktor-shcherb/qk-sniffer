@@ -16,12 +16,21 @@ MODEL_NAME = "meta/llama3-8b"
 OTHER_MODEL_NAME = "org/other-model"
 
 
-def _capture_row(*, position: int, bucket: int, example_id: int) -> CaptureRow:
+def _capture_row(
+    *,
+    position: int,
+    bucket: int,
+    example_id: int,
+    layer: int = 0,
+    head: int = 0,
+    vector_kind: str = "q",
+    model_name: str = MODEL_NAME,
+) -> CaptureRow:
     return CaptureRow(
-        model_name=MODEL_NAME,
-        layer_idx=0,
-        head_idx=0,
-        vector_kind="q",
+        model_name=model_name,
+        layer_idx=layer,
+        head_idx=head,
+        vector_kind=vector_kind,
         bucket=bucket,
         example_id=example_id,
         position=position,
@@ -217,3 +226,54 @@ def test_finalize_capture_preserves_other_splits_and_readme(tmp_path, monkeypatc
     model_names = {entry.get("name") for entry in front.get("models", [])}
     assert MODEL_NAME in model_names
     assert OTHER_MODEL_NAME in model_names
+    layer_entry = next(entry for entry in front.get("configs", []) if entry["config_name"] == "layer00")
+    paths = {item["path"] for item in layer_entry["data_files"]}
+    sanitized = sniff._sanitize_split_name(MODEL_NAME)
+    assert f"{sanitized}/l00h*/*.parquet" in paths
+    assert all(not path.startswith("data/") for path in paths)
+
+
+def test_finalize_capture_keeps_existing_configs(tmp_path, monkeypatch):
+    remote_repo = tmp_path / "remote_repo"
+    remote_repo.mkdir()
+    base_root = tmp_path / "local"
+    final_root = base_root / "final"
+    staging_root = base_root / "staging"
+    staging_root.mkdir(parents=True)
+
+    _write_rows(
+        remote_repo,
+        [
+            _capture_row(position=1, bucket=1, example_id=1, layer=0),
+            _capture_row(position=2, bucket=1, example_id=2, layer=31),
+        ],
+    )
+    _write_rows(staging_root, [_capture_row(position=3, bucket=2, example_id=3, layer=0)])
+
+    def fake_pull(settings):
+        dest = Path(settings.data_root)
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(remote_repo, dest)
+
+    monkeypatch.setattr(sniff, "pull_remote_dataset", fake_pull)
+
+    config = sniff.SniffConfig(
+        dataset=sniff.DatasetSettings(path="dummy", split="train", text_column="text"),
+        model=sniff.ModelSettings(name=MODEL_NAME),
+        tokenizer=sniff.TokenizerSettings(name=MODEL_NAME),
+        inference=sniff.InferenceSettings(),
+        capture=sniff.CaptureSettings(),
+        output=sniff.OutputSettings(data_root=str(base_root), readme_path="README.md"),
+    )
+
+    final_output = replace(config.output, data_root=str(final_root))
+    sniff.finalize_capture(config, staging_root, final_output)
+
+    split_dir = final_root / sniff._sanitize_split_name(MODEL_NAME)
+    layer0 = split_dir / "l00h00q" / "data.parquet"
+    layer31 = split_dir / "l31h00q" / "data.parquet"
+    assert layer0.exists()
+    assert layer31.exists()
+    assert sorted(pq.read_table(layer0).column("position").to_pylist()) == [1, 3]
+    assert pq.read_table(layer31).column("position").to_pylist() == [2]
