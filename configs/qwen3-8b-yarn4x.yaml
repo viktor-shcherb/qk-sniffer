@@ -1,0 +1,42 @@
+dataset:
+  path: viktoroo/longbench2-128k-plus
+  name: null
+  split: train
+  text_column: text
+  max_samples: 2048
+
+model:
+  name: Qwen/Qwen3-8B
+  revision: main
+  dtype: bfloat16
+  device_map: auto
+  trust_remote_code: false
+  config_overrides:
+    rope_scaling:
+      rope_type: yarn
+      factor: 4.0
+      original_max_position_embeddings: 32768
+
+tokenizer:
+  name: Qwen/Qwen3-8B
+  max_length: 131072
+  padding: longest
+
+inference:
+  batch_size: 1
+  autocast_dtype: bfloat16
+
+capture:
+  capture_queries: true
+  capture_keys: true
+  layers: null
+  heads: null
+  min_bucket_size: 2048
+  sampler:
+    type: uniform
+    base_rate: 3.0
+
+output:
+  data_root: data/sniffed-qk-qwen3-8b-yarn4x
+  readme_path: README.md
+  hf_repo_id: viktoroo/sniffed-qk-qwen3-8b-yarn4x

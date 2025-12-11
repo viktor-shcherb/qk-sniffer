@@ -22,7 +22,7 @@ import pyarrow.parquet as pq
 from datasets import Dataset, load_dataset
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.errors import RepositoryNotFoundError, HfHubHTTPError
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from sniffer import (
     LogUniformSampler,
@@ -72,6 +72,7 @@ class ModelSettings:
     dtype: str = "float16"
     device_map: Optional[Any] = "auto"
     trust_remote_code: bool = False
+    config_overrides: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -174,6 +175,30 @@ def prepare_tokenizer(settings: TokenizerSettings, model_name: str):
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
     tokenizer.padding_side = "right"
     return tokenizer
+
+
+def _apply_model_config_overrides(model_config, overrides: Dict[str, Any]) -> None:
+    for key, value in overrides.items():
+        if isinstance(value, dict):
+            existing = getattr(model_config, key, None)
+            if isinstance(existing, dict):
+                merged = {**existing, **value}
+                setattr(model_config, key, merged)
+                continue
+        setattr(model_config, key, value)
+
+
+def prepare_model_config(settings: ModelSettings):
+    overrides = settings.config_overrides
+    if not overrides:
+        return None
+    model_config = AutoConfig.from_pretrained(
+        settings.name,
+        revision=settings.revision,
+        trust_remote_code=settings.trust_remote_code,
+    )
+    _apply_model_config_overrides(model_config, overrides)
+    return model_config
 
 
 def resolve_dtype(name: str) -> torch.dtype:
@@ -448,12 +473,17 @@ def run_inference(config: SniffConfig) -> None:
     staging_readme = resolve_readme_path(staging_output)
 
     torch_dtype = resolve_dtype(config.model.dtype)
+    model_config = prepare_model_config(config.model)
+    model_kwargs = {}
+    if model_config is not None:
+        model_kwargs["config"] = model_config
     model = AutoModelForCausalLM.from_pretrained(
         config.model.name,
         revision=config.model.revision,
         dtype=torch_dtype,
         device_map=config.model.device_map,
         trust_remote_code=config.model.trust_remote_code,
+        **model_kwargs,
     )
     model.eval()
 
