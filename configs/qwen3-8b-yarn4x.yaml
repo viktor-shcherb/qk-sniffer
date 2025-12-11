@@ -31,7 +31,7 @@ capture:
   capture_keys: true
   layers: null
   heads: null
-  min_bucket_size: 2048
+  min_bucket_size: 8192
   sampler:
     type: uniform
     base_rate: 3.0
