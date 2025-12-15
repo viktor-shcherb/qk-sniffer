@@ -47,7 +47,7 @@
    # or
    PYTHONPATH=. python sniff.py --config configs/sample_sniff.yaml
    ```
-   The CLI patches local modeling files into `transformers`, downloads the latest dataset snapshot (if `hf_repo_id` is set), runs inference, writes captures to a staging directory, refreshes the local dataset from the Hub again, replays the new rows directly into the synced copy, then uploads the result.
+   The CLI patches local modeling files into `transformers`, downloads the latest dataset snapshot (if `hf_repo_id` is set), runs inference, writes captures directly into that synced copy, then uploads the result.
 
 ## Key Configuration Notes
 - `dataset.*` maps directly to `datasets.load_dataset`. Set `max_samples` for dry runs.
@@ -57,9 +57,8 @@
   - `min_bucket_size` drives both bucketing and sampling: `log_uniform` rounds it up to the next power of two and uses it as the minimum `2^i` bucket width (bucket IDs remain the exponent `i`, so `b{i}` → `[2^i, 2^{i+1})`). `uniform` treats it as a fixed chunk size and stores `floor(position / min_bucket_size)`.
   - `sampler.type` controls the bucket definition automatically: `log_uniform` samples uniformly *within* each log bucket, while `uniform` samples uniformly over every fixed-width bucket. Both are deterministic per `(example, layer, head, kind)`.
 - `output.*`
-  - `data_root` is both your working directory and (optionally) the local clone of `hf_repo_id`.
-  - The CLI now maintains `data_root/final` (the synced dataset) and `data_root/staging` (the working tree). It pulls the repo into `final`, records new captures under `staging`, re-pulls `final`, then replays the staged Parquet shards (and README metadata) directly into `final` so only the touched files change before pushing.
-  - `readme_path` always points to the repo root copy (e.g., `data/sniffed-qk-qwen3-8b/README.md`). The CLI mirrors that README into `data_root/final` automatically before uploading so the Hugging Face repo keeps its top-level README while final metadata stays in sync.
+  - `data_root` is both your working directory and (optionally) the local clone of `hf_repo_id`. Each run pulls the repo into `data_root`, records captures there immediately, and pushes it back once inference finishes.
+  - `readme_path` may be relative (inside `data_root`) or absolute. It is rewritten in place so the Hub copy stays in sync with the local metadata before uploading.
 
 ## Capture Output & Dataset Layout
 - Each `(model split, layer, head, vector_kind)` writes to `data/<sanitized_model>/<lXXhYY{q|k}>/data.parquet`. Splits sanitize `[\W]` → `_` (e.g., `meta/llama3-8b` → `meta_llama3_8b`).

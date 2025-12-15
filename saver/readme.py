@@ -251,9 +251,8 @@ class DatasetReadme:
             lines.append(f"  - layers: {coverage['layer_count']}")
             lines.append(f"  - query heads: {coverage['query_heads']}")
             lines.append(f"  - key heads: {coverage['key_heads']}")
-            sampling = self._format_sampling_strategy(info)
-            if sampling:
-                lines.append(f"  - sampling: {sampling}")
+            for sampling_line in self._sampling_lines(info):
+                lines.append(f"  - {sampling_line}")
             counts = bucket_counts.get(model, Counter())
             if counts:
                 bucket_str = ", ".join(f"b{bucket}={counts[bucket]}" for bucket in sorted(counts))
@@ -262,21 +261,50 @@ class DatasetReadme:
             lines.append(f"  - buckets: {bucket_str}")
         return "\n".join(lines)
 
-    def _format_sampling_strategy(self, info: Dict[str, Union[str, int, float]]) -> str:
-        strategy = str(info.get("sampling_strategy", "")).strip().lower()
+    def _sampling_lines(self, info: Dict[str, Union[str, int, float]]) -> List[str]:
+        strategy_raw = info.get("sampling_strategy")
+        if not strategy_raw:
+            return []
+        strategy = str(strategy_raw).strip().lower()
         if not strategy:
-            return ""
+            return []
+        lines: List[str] = []
         if strategy == "log":
-            size = info.get("sampling_min_bucket_size")
-            if size:
-                return f"log (min bucket size: {size})"
-            return "log"
+            min_size = info.get("sampling_min_bucket_size")
+            if min_size is not None:
+                formatted = self._format_bucket_value(min_size)
+                lines.append(f"sampling strategy: log (min bucket size: {formatted})")
+                lines.append(f"bucket width: powers of two >= {formatted} tokens")
+            else:
+                lines.append("sampling strategy: log")
+                lines.append("bucket width: powers of two buckets")
+            return lines
         if strategy == "uniform":
-            size = info.get("sampling_bucket_size")
-            if size:
-                return f"uniform (bucket width: {size})"
-            return "uniform"
-        return strategy
+            bucket_size = info.get("sampling_bucket_size")
+            lines.append("sampling strategy: uniform")
+            if bucket_size is not None:
+                formatted = self._format_bucket_value(bucket_size)
+                lines.append(f"bucket width: {formatted} tokens")
+            return lines
+        # Fallback for custom sampler implementations.
+        lines.append(f"sampling strategy: {strategy}")
+        bucket_size = info.get("sampling_bucket_size")
+        if bucket_size is not None:
+            formatted = self._format_bucket_value(bucket_size)
+            lines.append(f"bucket width: {formatted} tokens")
+        return lines
+
+    @staticmethod
+    def _format_bucket_value(value: Union[str, int, float]) -> str:
+        if isinstance(value, bool):
+            return str(value)
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, float):
+            if value.is_integer():
+                return str(int(value))
+            return f"{value:g}"
+        return str(value)
 
     def _model_capture_stats(self, config_splits: Dict[str, Set[str]]) -> Dict[str, Dict[str, int]]:
         stats: Dict[str, Dict[str, Set]] = {}

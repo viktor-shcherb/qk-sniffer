@@ -5,7 +5,7 @@ import importlib
 import json
 import sys
 from contextlib import nullcontext
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 import re
 import shutil
 import tempfile
@@ -18,7 +18,6 @@ from tqdm.auto import tqdm
 
 import torch
 import yaml
-import pyarrow.parquet as pq
 from datasets import Dataset, load_dataset
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.errors import RepositoryNotFoundError, HfHubHTTPError
@@ -32,7 +31,6 @@ from sniffer import (
     set_active_example_ids,
     set_active_sequence_lengths,
 )
-from saver.dataset import CaptureRow, DatasetSaver
 
 load_dotenv()
 
@@ -459,18 +457,12 @@ def push_remote_dataset(settings: OutputSettings) -> None:
 
 def run_inference(config: SniffConfig) -> None:
     patch_modeling_modules()
-    base_root = Path(config.output.data_root)
-    final_root = base_root / "final"
-    staging_root = base_root / "staging"
-    final_output = replace(config.output, data_root=str(final_root))
-    staging_output = replace(config.output, data_root=str(staging_root))
-    pull_remote_dataset(final_output)
-    if staging_root.exists():
-        shutil.rmtree(staging_root)
-    staging_root.mkdir(parents=True, exist_ok=True)
+    data_root = Path(config.output.data_root)
+    pull_remote_dataset(config.output)
+    data_root.mkdir(parents=True, exist_ok=True)
     dataset = load_hf_dataset(config.dataset)
     tokenizer = prepare_tokenizer(config.tokenizer, config.model.name)
-    staging_readme = resolve_readme_path(staging_output)
+    readme_path = resolve_readme_path(config.output)
 
     torch_dtype = resolve_dtype(config.model.dtype)
     model_config = prepare_model_config(config.model)
@@ -490,8 +482,8 @@ def run_inference(config: SniffConfig) -> None:
     sampler_factory = build_sampler_factory(config.capture.sampler, min_bucket_size=config.capture.min_bucket_size)
     sniffer_config = SnifferConfig(
         model_name=config.model.name,
-        data_root=staging_root,
-        readme_path=staging_readme,
+        data_root=data_root,
+        readme_path=readme_path,
         capture_queries=config.capture.capture_queries,
         capture_keys=config.capture.capture_keys,
         layers=set(config.capture.layers) if config.capture.layers else None,
@@ -548,158 +540,7 @@ def run_inference(config: SniffConfig) -> None:
                 progress.update(len(texts))
     finally:
         progress.close()
-    finalize_capture(config, staging_root, final_output)
-    push_remote_dataset(final_output)
-
-
-def _sanitize_split_name(name: str) -> str:
-    return _SPLIT_SANITIZE_RE.sub("_", name)
-
-
-def _parse_config_name(config_name: str) -> Optional[tuple[int, int, str]]:
-    match = _CONFIG_NAME_RE.match(config_name)
-    if not match:
-        return None
-    return int(match.group(1)), int(match.group(2)), match.group(3)
-
-
-def _rows_from_table(
-    table,
-    *,
-    model_name: str,
-    layer_idx: int,
-    head_idx: int,
-    vector_kind: str,
-) -> List[CaptureRow]:
-    buckets = table.column("bucket").to_pylist()
-    example_ids = table.column("example_id").to_pylist()
-    positions = table.column("position").to_pylist()
-    vectors = table.column("vector").to_pylist()
-    sliding_windows = (
-        table.column("sliding_window").to_pylist()
-        if "sliding_window" in table.column_names
-        else [None] * table.num_rows
-    )
-    rows: List[CaptureRow] = []
-    for idx in range(table.num_rows):
-        rows.append(
-            CaptureRow(
-                model_name=model_name,
-                layer_idx=layer_idx,
-                head_idx=head_idx,
-                vector_kind=vector_kind,
-                bucket=int(buckets[idx]),
-                example_id=int(example_ids[idx]),
-                position=int(positions[idx]),
-                vector=list(vectors[idx]),
-                sliding_window=sliding_windows[idx] if sliding_windows[idx] is not None else None,
-            )
-        )
-    return rows
-
-
-def _collect_rows_by_config(root: Path, model_name: str) -> Dict[str, List[CaptureRow]]:
-    sanitized = _sanitize_split_name(model_name)
-    model_dir = root / sanitized
-    if not model_dir.exists():
-        return {}
-    rows_by_config: Dict[str, List[CaptureRow]] = {}
-    for config_dir in sorted(model_dir.iterdir()):
-        if not config_dir.is_dir():
-            continue
-        parsed = _parse_config_name(config_dir.name)
-        if not parsed:
-            continue
-        layer_idx, head_idx, vector_kind = parsed
-        data_path = config_dir / "data.parquet"
-        if not data_path.exists():
-            continue
-        table = pq.read_table(data_path)
-        if table.num_rows == 0:
-            continue
-        rows_by_config[config_dir.name] = _rows_from_table(
-            table,
-            model_name=model_name,
-            layer_idx=layer_idx,
-            head_idx=head_idx,
-            vector_kind=vector_kind,
-        )
-    return rows_by_config
-
-
-def _read_existing_config_rows(root: Path, model_name: str, config_name: str) -> List[CaptureRow]:
-    parsed = _parse_config_name(config_name)
-    if not parsed:
-        return []
-    layer_idx, head_idx, vector_kind = parsed
-    config_dir = root / _sanitize_split_name(model_name) / config_name
-    data_path = config_dir / "data.parquet"
-    if not data_path.exists():
-        return []
-    try:
-        table = pq.read_table(data_path)
-    except Exception as err:
-        print(f"[sniff] Skipping existing data for {model_name}/{config_name}: {err}")
-        return []
-    if table.num_rows == 0:
-        return []
-    return _rows_from_table(
-        table,
-        model_name=model_name,
-        layer_idx=layer_idx,
-        head_idx=head_idx,
-        vector_kind=vector_kind,
-    )
-
-
-def finalize_capture(
-    config: SniffConfig,
-    staging_root: Path,
-    final_output: OutputSettings,
-) -> None:
-    staging_path = Path(staging_root)
-    final_path = Path(final_output.data_root)
-    staging_rows = _collect_rows_by_config(staging_path, config.model.name)
-    pull_remote_dataset(final_output)
-
-    if staging_rows:
-        sanitized_split = _sanitize_split_name(config.model.name)
-        existing_rows: Dict[str, List[CaptureRow]] = {}
-        for config_name in staging_rows:
-            rows = _read_existing_config_rows(final_path, config.model.name, config_name)
-            if rows:
-                existing_rows[config_name] = rows
-            config_dir = final_path / sanitized_split / config_name
-            if config_dir.exists():
-                shutil.rmtree(config_dir)
-        primary_readme = _absolute_path(resolve_readme_path(config.output))
-        final_readme = _absolute_path(resolve_readme_path(final_output))
-        mirror_paths: List[Path] = []
-        if final_readme != primary_readme:
-            mirror_paths.append(final_readme)
-        saver = DatasetSaver(
-            root=final_path,
-            readme_path=primary_readme,
-            write_batch_size=config.output.write_batch_size,
-            mirror_readme_paths=mirror_paths or None,
-        )
-        saver.register_model_metadata(
-            config.model.name,
-            {
-                "source_dataset": config.dataset.path,
-                "dataset_name": config.dataset.name or "",
-                "dataset_split": config.dataset.split,
-            },
-        )
-        for config_name in sorted(staging_rows):
-            combined = existing_rows.get(config_name, []) + staging_rows[config_name]
-            if combined:
-                saver.add_many(combined)
-        saver.close()
-
-    if staging_path.exists():
-        shutil.rmtree(staging_path)
-    staging_path.mkdir(parents=True, exist_ok=True)
+    push_remote_dataset(config.output)
 
 
 def main():

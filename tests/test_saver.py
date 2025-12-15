@@ -124,7 +124,8 @@ def test_dataset_saver_includes_model_stats_in_readme(tmp_path):
     assert "dummy/dataset" in readme
     assert "b2=1" in readme
     assert "split: `meta_llama3_8b`" in readme
-    assert "sampling: log" in readme
+    assert "sampling strategy: log (min bucket size: 128)" in readme
+    assert "bucket width: powers of two >= 128 tokens" in readme
     assert "layers: 1" in readme
     assert "query heads: 1" in readme
     assert "key heads: 0" in readme
