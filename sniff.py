@@ -79,6 +79,7 @@ class TokenizerSettings:
     max_length: int = 4096
     padding: str = "longest"
     trust_remote_code: bool = False
+    padding_side: str = "right"
 
 
 @dataclass
@@ -175,7 +176,7 @@ def prepare_tokenizer(settings: TokenizerSettings, model_name: str):
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
-    tokenizer.padding_side = "right"
+    tokenizer.padding_side = settings.padding_side
     return tokenizer
 
 

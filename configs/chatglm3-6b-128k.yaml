@@ -16,6 +16,7 @@ tokenizer:
   name: zai-org/chatglm3-6b-128k
   max_length: 131072
   padding: longest
+  padding_side: left
   trust_remote_code: true
 
 inference:
