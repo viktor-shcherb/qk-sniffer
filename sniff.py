@@ -78,6 +78,7 @@ class TokenizerSettings:
     name: Optional[str] = None
     max_length: int = 4096
     padding: str = "longest"
+    trust_remote_code: bool = False
 
 
 @dataclass
@@ -168,7 +169,10 @@ def load_hf_dataset(settings: DatasetSettings) -> Dataset:
 
 def prepare_tokenizer(settings: TokenizerSettings, model_name: str):
     tokenizer_name = settings.name or model_name
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name,
+        trust_remote_code=settings.trust_remote_code,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
     tokenizer.padding_side = "right"
