@@ -10,7 +10,7 @@ model:
   revision: main
   dtype: bfloat16
   device_map: auto
-  trust_remote_code: false
+  trust_remote_code: true
 
 tokenizer:
   name: Qwen/Qwen2-7B
