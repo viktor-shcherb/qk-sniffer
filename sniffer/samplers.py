@@ -7,6 +7,26 @@ import math
 
 import torch
 
+_UINT64_MASK = 0xFFFFFFFFFFFFFFFF
+
+
+def _mix64(value: int) -> int:
+    """Avalanche a 64-bit integer (SplitMix64 finalizer)."""
+    value &= _UINT64_MASK
+    value ^= value >> 30
+    value = (value * 0xBF58476D1CE4E5B9) & _UINT64_MASK
+    value ^= value >> 27
+    value = (value * 0x94D049BB133111EB) & _UINT64_MASK
+    value ^= value >> 31
+    return value
+
+
+def _combine_seed(seed: int, value: int) -> int:
+    seed ^= value
+    seed = (seed * 0x9E3779B97F4A7C15) & _UINT64_MASK
+    seed ^= seed >> 32
+    return seed & _UINT64_MASK
+
 
 class Sampler(ABC):
     @abstractmethod
@@ -24,14 +44,18 @@ class Sampler(ABC):
 
 
 def _seed(example_id: int, layer_idx: int, head_idx: int, vector_kind: str) -> int:
-    seed = (
-        (example_id & 0xFFFFFFFF)
-        ^ ((layer_idx & 0xFFFFFFFF) << 8)
-        ^ ((head_idx & 0xFFFFFFFF) << 16)
-        ^ (ord(vector_kind[0]) << 24)
+    """Generate a deterministic 64-bit seed for RNGs without bit collisions."""
+
+    components = (
+        _mix64(int(example_id)),
+        _mix64(int(layer_idx)),
+        _mix64(int(head_idx)),
+        _mix64(ord(vector_kind[0]) & 0xFF),
     )
-    seed ^= 0x9E3779B97F4A7C15
-    return seed & 0xFFFFFFFFFFFFFFFF
+    seed = 0x243F6A8885A308D3  # non-zero initializer from ChaCha constants
+    for value in components:
+        seed = _combine_seed(seed, value)
+    return seed & _UINT64_MASK
 
 
 @dataclass(slots=True)

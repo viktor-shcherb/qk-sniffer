@@ -3,6 +3,7 @@ dataset:
   name: null
   split: train
   text_column: text
+  id_column: id
   max_samples: 1024
 
 model:

@@ -20,6 +20,7 @@ from sniffer import (
     set_active_example_ids,
     set_active_sequence_lengths,
 )
+from sniffer.samplers import _seed
 
 
 class AlwaysSampler(Sampler):
@@ -393,6 +394,12 @@ def test_log_uniform_sampler_bucket_size_scaling():
     )
     # base_rate equals bucket_size up to bucket 2, so every entry kept deterministically
     assert mask.all().item()
+
+
+def test_sampler_seed_avoids_periodic_head_collisions():
+    a = _seed(example_id=0, layer_idx=0, head_idx=1, vector_kind="q")
+    b = _seed(example_id=1 << 16, layer_idx=0, head_idx=0, vector_kind="q")
+    assert a != b
 
 
 def test_log_uniform_sampler_rejects_invalid_min_bucket_size():
