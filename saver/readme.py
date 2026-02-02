@@ -286,6 +286,15 @@ class DatasetReadme:
                 formatted = self._format_bucket_value(bucket_size)
                 lines.append(f"bucket width: {formatted} tokens")
             return lines
+        if strategy == "all":
+            lines.append("sampling strategy: all (no subsampling)")
+            bucket_size = info.get("sampling_bucket_size")
+            if bucket_size is not None:
+                formatted = self._format_bucket_value(bucket_size)
+                lines.append(f"bucket width: {formatted} tokens")
+            else:
+                lines.append("bucket width: not applicable")
+            return lines
         # Fallback for custom sampler implementations.
         lines.append(f"sampling strategy: {strategy}")
         bucket_size = info.get("sampling_bucket_size")
@@ -342,6 +351,7 @@ class DatasetReadme:
             ),
             ("example_id", "Index of the example within the batch when the vector was captured."),
             ("position", "Token position within the example's sequence (0-indexed)."),
+            ("token_str", "Optional string representation of the token at this position, if captured."),
             ("vector", "Float32 tensor containing the query or key vector; the config name encodes which."),
             ("sliding_window", "Size of the sliding window for local attention (null implies global causal)."),
         ]

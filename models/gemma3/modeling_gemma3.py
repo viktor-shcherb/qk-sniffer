@@ -315,17 +315,30 @@ class Gemma3Attention(nn.Module):
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
         sniffer = get_active_sniffer()
+        capture_pre_rope = False
+        positions = None
         if sniffer is not None:
+            capture_pre_rope = bool(getattr(sniffer.config, "capture_pre_rope", False))
             positions = compute_positions(
                 batch_size=query_states.shape[0],
                 seq_len=query_states.shape[2],
                 device=query_states.device,
                 cache_position=cache_position,
             )
+            if capture_pre_rope:
+                sniffer.capture(
+                    layer_idx=self.layer_idx,
+                    query_states=query_states,
+                    key_states=key_states,
+                    positions=positions,
+                    sliding_window=self.sliding_window,
+                )
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if sniffer is not None and not capture_pre_rope:
             sniffer.capture(
                 layer_idx=self.layer_idx,
                 query_states=query_states,

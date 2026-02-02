@@ -3,7 +3,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import math
-import math
 
 import torch
 
@@ -136,3 +135,21 @@ class UniformSampler(Sampler):
         generator.manual_seed(_seed(example_id, layer_idx, head_idx, vector_kind))
         random_values = torch.rand(probs.shape, generator=generator, device=device, dtype=torch.float32)
         return random_values < probs
+
+
+@dataclass(slots=True)
+class AllSampler(Sampler):
+    bucket_kind: str = "all"
+
+    def sample_positions(
+        self,
+        *,
+        layer_idx: int,
+        head_idx: int,
+        vector_kind: str,
+        example_id: int,
+        positions: torch.Tensor,
+        buckets: torch.Tensor,
+    ) -> torch.Tensor:
+        _ = (layer_idx, head_idx, vector_kind, example_id, buckets)
+        return torch.ones_like(positions, dtype=torch.bool)

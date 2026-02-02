@@ -34,8 +34,10 @@
     capture_keys: true
     min_bucket_size: 128
     sampler:
-      type: log_uniform       # or uniform
+      type: log_uniform       # log_uniform | uniform | all
       base_rate: 1.0
+    capture_pre_rope: false
+    capture_token_strings: false
    output:
      data_root: data/sniffed-qk
      readme_path: README.md
@@ -54,8 +56,11 @@
 - `model.*`/`tokenizer.*` feed `AutoModelForCausalLM` and `AutoTokenizer`. `device_map=auto` works well for multi-GPU.
 - `capture.*`
   - `layers`, `heads` accept Python-style integer lists; omit to capture every head.
-  - `min_bucket_size` drives both bucketing and sampling: `log_uniform` rounds it up to the next power of two and uses it as the minimum `2^i` bucket width (bucket IDs remain the exponent `i`, so `b{i}` → `[2^i, 2^{i+1})`). `uniform` treats it as a fixed chunk size and stores `floor(position / min_bucket_size)`.
-  - `sampler.type` controls the bucket definition automatically: `log_uniform` samples uniformly *within* each log bucket, while `uniform` samples uniformly over every fixed-width bucket. Both are deterministic per `(example, layer, head, kind)`.
+  - `sampler.type=all` captures every token (no subsampling) while still bucketing by `min_bucket_size` for reporting. To capture the first *N* tokens, set `tokenizer.max_length` to *N*.
+  - `min_bucket_size` drives bucketing (and sampling for `log_uniform`/`uniform`): `log_uniform` rounds it up to the next power of two and uses it as the minimum `2^i` bucket width (bucket IDs remain the exponent `i`, so `b{i}` → `[2^i, 2^{i+1})`). `uniform` and `all` store `floor(position / min_bucket_size)`.
+  - `capture_pre_rope` captures Q/K before rotary position embedding is applied (default captures post-RoPE).
+  - `capture_token_strings` stores an extra `token_str` column with the tokenizer string for each captured position.
+- `sampler.type` controls the bucket definition automatically: `log_uniform` samples uniformly *within* each log bucket, `uniform` samples uniformly over every fixed-width bucket, and `all` disables subsampling while still reporting uniform buckets. All are deterministic per `(example, layer, head, kind)`.
 - `output.*`
   - `data_root` is both your working directory and (optionally) the local clone of `hf_repo_id`. Each run pulls the repo into `data_root`, records captures there immediately, and pushes it back once inference finishes.
   - `readme_path` may be relative (inside `data_root`) or absolute. It is rewritten in place so the Hub copy stays in sync with the local metadata before uploading.
@@ -68,9 +73,10 @@
 
   | Column           | Description                                                                                                                                                                                                                                                                                                                                    |
   |------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| | `bucket`         | Identifier of the bucket the token fell into. `log_uniform` stores the exponent `i` (clamped upward so the first bucket spans ≥ `min_bucket_size`), meaning bucket `b{i}` maps to `[2^i, 2^{i+1})`. `uniform` stores `floor(position / min_bucket_size)` so every bucket covers exactly `min_bucket_size` tokens (last bucket may be smaller). |
+| | `bucket`         | Identifier of the bucket the token fell into. `log_uniform` stores the exponent `i` (clamped upward so the first bucket spans ≥ `min_bucket_size`), meaning bucket `b{i}` maps to `[2^i, 2^{i+1})`. `uniform` and `all` store `floor(position / min_bucket_size)` so every bucket covers exactly `min_bucket_size` tokens (last bucket may be smaller). |
   | `example_id`     | Batch ID from `set_active_example_ids` (or the implicit index).                                                                                                                                                                                                                                                                                |
   | `position`       | Token index after any cache offset.                                                                                                                                                                                                                                                                                                            |
+  | `token_str`      | Optional string representation of the token at this position (if enabled).                                                                                                                                                                                                                                                                    |
   | `vector`         | Float32 list representing the captured query/key vector.                                                                                                                                                                                                                                                                                       |
   | `sliding_window` | Sliding-window size for local attention layers (`null` for full causal).                                                                                                                                                                                                                                                                       |
 

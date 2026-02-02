@@ -29,6 +29,8 @@ class SnifferConfig:
     max_rows_per_batch: Optional[int] = None
     write_batch_size: int = 2048
     min_bucket_size: int = 128
+    capture_pre_rope: bool = False
+    capture_token_strings: bool = False
 
 
 class Sniffer:
@@ -43,17 +45,18 @@ class Sniffer:
         metadata = dict(self.config.metadata)
         self._example_ids: Optional[Sequence[int]] = None
         self._sequence_lengths: Optional[List[int]] = None
+        self._token_strings: Optional[List[List[str]]] = None
         requested_min_bucket = int(config.min_bucket_size)
         if requested_min_bucket < 1:
             raise ValueError("min_bucket_size must be at least 1.")
-        self.sampler: Sampler = (
+        self.sampler = (
             config.sampler_factory()
             if config.sampler_factory is not None
             else LogUniformSampler(min_bucket_size=requested_min_bucket)
         )
         self._bucket_kind = getattr(self.sampler, "bucket_kind", "log").lower()
-        if self._bucket_kind not in {"log", "uniform"}:
-            raise ValueError("Sampler must declare bucket_kind 'log' or 'uniform'.")
+        if self._bucket_kind not in {"log", "uniform", "all"}:
+            raise ValueError("Sampler must declare bucket_kind 'log', 'uniform', or 'all'.")
         if self._bucket_kind == "log":
             if requested_min_bucket == 1:
                 self._min_bucket_power = 0
@@ -62,10 +65,10 @@ class Sniffer:
             self._log_bucket_floor = float(self._min_bucket_power)
             self._effective_min_bucket_size = 1 << self._min_bucket_power
             metadata.setdefault("sampling_min_bucket_size", self._effective_min_bucket_size)
-        else:
+        elif self._bucket_kind in {"uniform", "all"}:
             self._uniform_bucket_size = requested_min_bucket
             metadata.setdefault("sampling_bucket_size", self._uniform_bucket_size)
-        metadata.setdefault("sampling_strategy", self._bucket_kind)
+        metadata.setdefault("sampling_strategy", "all" if self._bucket_kind == "all" else self._bucket_kind)
         self.saver.register_model_metadata(self.config.model_name, metadata)
         self._writer = _CaptureWorker(self.saver, queue_size=queue_size)
         self._max_rows_per_batch: Optional[int] = (
@@ -90,15 +93,19 @@ class Sniffer:
             device = query_states.device
             positions = positions.to(device=device, dtype=torch.int64)
             example_ids = self._prepare_example_ids(batch_size, seq_len, device)
-            positions_fp = positions.to(torch.float32)
+            token_strings = self._prepare_token_strings(batch_size, seq_len)
             if self._bucket_kind == "log":
+                positions_fp = positions.to(torch.float32)
                 raw_buckets = torch.floor(torch.log2(positions_fp + 1.0))
                 bucket_floor = float(self._min_bucket_power)
                 clamped = torch.clamp(raw_buckets, min=bucket_floor)
                 buckets = clamped.to(torch.int64)
-            else:
+            elif self._bucket_kind in {"uniform", "all"}:
+                positions_fp = positions.to(torch.float32)
                 bucket_size = float(self._uniform_bucket_size)
                 buckets = torch.floor(positions_fp / bucket_size).to(torch.int64)
+            else:
+                buckets = torch.zeros_like(positions, dtype=torch.int64)
             valid_lengths = self._resolve_sequence_lengths(batch_size, seq_len)
 
             if self.config.capture_queries:
@@ -111,6 +118,7 @@ class Sniffer:
                     buckets=buckets,
                     valid_lengths=valid_lengths,
                     sliding_window=sliding_window,
+                    token_strings=token_strings,
                 )
             if self.config.capture_keys:
                 self._capture_tensor(
@@ -122,6 +130,7 @@ class Sniffer:
                     buckets=buckets,
                     valid_lengths=valid_lengths,
                     sliding_window=sliding_window,
+                    token_strings=token_strings,
                 )
 
     def close(self) -> None:
@@ -140,6 +149,9 @@ class Sniffer:
 
     def set_sequence_lengths(self, sequence_lengths: Sequence[int]) -> None:
         self._sequence_lengths = [max(0, int(length)) for length in sequence_lengths]
+
+    def set_token_strings(self, token_strings: Sequence[Sequence[str]]) -> None:
+        self._token_strings = [list(tokens) for tokens in token_strings]
 
     def _resolve_sequence_lengths(self, batch_size: int, seq_len: int) -> List[int]:
         if self._sequence_lengths is None:
@@ -162,6 +174,7 @@ class Sniffer:
         buckets: torch.Tensor,
         valid_lengths: Sequence[int],
         sliding_window: Optional[int],
+        token_strings: Optional[Sequence[Sequence[str]]],
     ) -> None:
         batch_size, num_heads, _, _ = states.shape
         for head_idx in self._head_indices(num_heads):
@@ -196,11 +209,17 @@ class Sniffer:
                 positions_kept = position_slice[mask]
                 buckets_kept = bucket_slice[mask]
                 examples_kept = example_slice[mask]
+                tokens_kept: Optional[List[str]] = None
+                if token_strings is not None:
+                    token_slice = list(token_strings[batch_idx])[:valid_length]
+                    mask_list = mask.detach().to(device="cpu").tolist()
+                    tokens_kept = [tok for tok, keep in zip(token_slice, mask_list) if keep]
                 (
                     vectors,
                     examples_kept,
                     positions_kept,
                     buckets_kept,
+                    tokens_kept,
                 ) = self._maybe_downsample(
                     layer_idx=layer_idx,
                     head_idx=head_idx,
@@ -210,6 +229,7 @@ class Sniffer:
                     example_ids=examples_kept,
                     positions=positions_kept,
                     buckets=buckets_kept,
+                    token_strings=tokens_kept,
                 )
                 batch_payload = self._build_capture_batch(
                     layer_idx=layer_idx,
@@ -220,6 +240,7 @@ class Sniffer:
                     positions=positions_kept,
                     buckets=buckets_kept,
                     sliding_window=sliding_window,
+                    token_strings=tokens_kept,
                 )
                 if batch_payload is not None:
                     self._writer.submit(batch_payload)
@@ -244,18 +265,22 @@ class Sniffer:
         example_ids: torch.Tensor,
         positions: torch.Tensor,
         buckets: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        token_strings: Optional[Sequence[str]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[List[str]]]:
         limit = self._max_rows_per_batch
         row_count = vectors.shape[0]
         if limit is None or row_count <= limit:
-            return vectors, example_ids, positions, buckets
+            return vectors, example_ids, positions, buckets, list(token_strings) if token_strings is not None else None
         generator = torch.Generator(device=vectors.device)
         generator.manual_seed(
             self._subsample_seed(layer_idx=layer_idx, head_idx=head_idx, vector_kind=vector_kind, example_id=example_id)
         )
         perm = torch.randperm(row_count, device=vectors.device, generator=generator)
         keep = perm[:limit]
-        return vectors[keep], example_ids[keep], positions[keep], buckets[keep]
+        kept_tokens: Optional[List[str]] = None
+        if token_strings is not None:
+            kept_tokens = [token_strings[idx] for idx in keep.to("cpu").tolist()]
+        return vectors[keep], example_ids[keep], positions[keep], buckets[keep], kept_tokens
 
     def _build_capture_batch(
         self,
@@ -268,10 +293,13 @@ class Sniffer:
         positions: torch.Tensor,
         buckets: torch.Tensor,
         sliding_window: Optional[int],
+        token_strings: Optional[Sequence[str]],
     ) -> Optional[CaptureBatch]:
         row_count = vectors.shape[0]
         if row_count == 0:
             return None
+        if token_strings is not None and len(token_strings) != row_count:
+            raise ValueError("Token strings length must match number of captured rows.")
         return CaptureBatch(
             model_name=self.config.model_name,
             layer_idx=layer_idx,
@@ -282,6 +310,7 @@ class Sniffer:
             positions=positions.detach().to(device="cpu", dtype=torch.int64).contiguous().numpy(),
             vectors=vectors.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy(),
             sliding_window=sliding_window,
+            token_strings=list(token_strings) if token_strings is not None else None,
         )
 
     def _subsample_seed(self, *, layer_idx: int, head_idx: int, vector_kind: str, example_id: int) -> int:
@@ -304,6 +333,25 @@ class Sniffer:
                 )
             base = torch.tensor(self._example_ids, device=device, dtype=torch.int64)
         return base.unsqueeze(1).expand(-1, seq_len)
+
+    def _prepare_token_strings(self, batch_size: int, seq_len: int) -> Optional[List[List[str]]]:
+        if not self.config.capture_token_strings:
+            return None
+        if self._token_strings is None:
+            raise ValueError("Token string capture enabled but token strings were not provided.")
+        if len(self._token_strings) != batch_size:
+            raise ValueError(
+                f"Expected {batch_size} token string rows, got {len(self._token_strings)}. "
+                "Call set_active_token_strings with values for each batch item."
+            )
+        prepared: List[List[str]] = []
+        for idx, tokens in enumerate(self._token_strings):
+            if len(tokens) < seq_len:
+                raise ValueError(
+                    f"Token string length {len(tokens)} shorter than sequence length {seq_len} for batch index {idx}."
+                )
+            prepared.append(list(tokens[:seq_len]))
+        return prepared
 
 
 _CAPTURE_SENTINEL: object = object()
@@ -376,6 +424,13 @@ def set_active_sequence_lengths(sequence_lengths: Sequence[int]) -> None:
     if sniffer is None:
         raise RuntimeError("No active sniffer session to attach sequence lengths.")
     sniffer.set_sequence_lengths(sequence_lengths)
+
+
+def set_active_token_strings(token_strings: Sequence[Sequence[str]]) -> None:
+    sniffer = get_active_sniffer()
+    if sniffer is None:
+        raise RuntimeError("No active sniffer session to attach token strings.")
+    sniffer.set_token_strings(token_strings)
 
 
 @contextmanager

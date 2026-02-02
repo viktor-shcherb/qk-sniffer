@@ -53,6 +53,33 @@ def test_dataset_saver_writes_parquet_and_readme(tmp_path):
     assert "- [meta/llama3-8b](https://huggingface.co/meta/llama3-8b)" in body
 
 
+def test_dataset_saver_writes_token_strings(tmp_path):
+    saver = DatasetSaver(
+        root=tmp_path / "data",
+        readme_path=tmp_path / "README.md",
+        dataset_name="viktoroo/sniffed-qk-test",
+    )
+    row = CaptureRow(
+        model_name="meta/llama3-8b",
+        layer_idx=0,
+        head_idx=0,
+        vector_kind="q",
+        bucket=0,
+        example_id=0,
+        position=0,
+        vector=[0.1],
+        sliding_window=None,
+        token_str="tok",
+    )
+    saver.add(row)
+    saver.close()
+
+    parquet_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    table = pq.read_table(parquet_path)
+    assert "token_str" in table.schema.names
+    assert table.column("token_str").to_pylist() == ["tok"]
+
+
 def test_dataset_saver_skips_duplicates_same_session(tmp_path):
     saver = DatasetSaver(root=tmp_path / "data", readme_path=tmp_path / "README.md")
     row = _row("meta/llama3-8b", layer=0, head=0, kind="q", bucket=0, example_id=0, position=0, vector=[0.1])

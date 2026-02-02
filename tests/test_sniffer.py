@@ -9,6 +9,7 @@ import torch
 import yaml
 
 from sniffer import (
+    AllSampler,
     LogUniformSampler,
     UniformSampler,
     Sampler,
@@ -45,6 +46,8 @@ class UniformBucketSampler(Sampler):
     def sample_positions(self, **kwargs):
         positions: torch.Tensor = kwargs["positions"]
         return torch.ones_like(positions, dtype=torch.bool)
+
+
 
 
 def test_sniffer_captures_qk(tmp_path):
@@ -160,6 +163,51 @@ def test_sniffer_respects_sequence_lengths(tmp_path):
     table = pq.read_table(q_path)
     assert table.num_rows == 2
     assert table.column("position").to_pylist() == [0, 1]
+
+def test_sniffer_captures_token_strings(tmp_path):
+    config = SnifferConfig(
+        model_name="meta/llama3-8b",
+        data_root=tmp_path / "data",
+        readme_path=tmp_path / "README.md",
+        sampler_factory=lambda: AlwaysSampler(),
+        min_bucket_size=1,
+        capture_token_strings=True,
+    )
+    sniffer = Sniffer(config)
+    sniffer.set_token_strings([["A", "B", "C"]])
+
+    states = torch.randn(1, 1, 3, 4)
+    positions = compute_positions(batch_size=1, seq_len=3, device=states.device, cache_position=None)
+    sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
+    sniffer.close()
+
+    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    table = pq.read_table(q_path)
+    assert "token_str" in table.schema.names
+    assert table.column("token_str").to_pylist() == ["A", "B", "C"]
+
+
+def test_sniffer_all_sampler_uses_uniform_buckets(tmp_path):
+    config = SnifferConfig(
+        model_name="meta/llama3-8b",
+        data_root=tmp_path / "data",
+        readme_path=tmp_path / "README.md",
+        sampler_factory=lambda: AllSampler(),
+        min_bucket_size=32,
+    )
+    sniffer = Sniffer(config)
+
+    states = torch.ones(1, 1, 4, 4)
+    cache_position = torch.tensor([256], dtype=torch.int64)
+    positions = compute_positions(batch_size=1, seq_len=4, device=states.device, cache_position=cache_position)
+    sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
+    sniffer.close()
+
+    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    table = pq.read_table(q_path)
+    assert table.num_rows == 4
+    assert table.column("position").to_pylist() == [256, 257, 258, 259]
+    assert table.column("bucket").to_pylist() == [8, 8, 8, 8]
 
 
 def test_sniffer_max_rows_per_batch(tmp_path):

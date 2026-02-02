@@ -6,6 +6,7 @@ import json
 import sys
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+import hashlib
 import re
 import shutil
 import tempfile
@@ -24,12 +25,14 @@ from huggingface_hub.errors import RepositoryNotFoundError, HfHubHTTPError
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from sniffer import (
+    AllSampler,
     LogUniformSampler,
     SnifferConfig,
     UniformSampler,
     activate_sniffer,
     set_active_example_ids,
     set_active_sequence_lengths,
+    set_active_token_strings,
 )
 
 load_dotenv()
@@ -51,6 +54,8 @@ class CaptureSettings:
     max_rows_per_batch: Optional[int] = None
     queue_size: int = 8
     min_bucket_size: int = 128
+    capture_pre_rope: bool = False
+    capture_token_strings: bool = False
 
 
 @dataclass
@@ -241,6 +246,13 @@ def build_sampler_factory(settings: SamplerSettings, *, min_bucket_size: int):
 
         return factory
 
+    if sampler_type == "all":
+
+        def factory():
+            return AllSampler()
+
+        return factory
+
     raise ValueError(f"Unsupported sampler type '{settings.type}'.")
 
 
@@ -252,10 +264,55 @@ def batch_iter(dataset: Dataset, settings: DatasetSettings, batch_size: int) -> 
         slice_ = dataset[start : start + batch_size]
         texts = slice_[text_col]
         if id_col:
-            ids = slice_[id_col]
+            ids = _normalize_example_ids(slice_[id_col])
         else:
             ids = list(range(start, start + len(texts)))
         yield {"texts": texts, "example_ids": ids}
+
+
+_INT64_MIN = -(1 << 63)
+_INT64_MAX = (1 << 63) - 1
+
+
+def _hash_to_int64(value: Any) -> int:
+    digest = hashlib.blake2b(str(value).encode("utf-8"), digest_size=8).digest()
+    unsigned = int.from_bytes(digest, "little", signed=False)
+    if unsigned > _INT64_MAX:
+        return unsigned - (1 << 64)
+    return unsigned
+
+
+def _normalize_example_ids(raw_ids: Sequence[Any]) -> List[int]:
+    normalized: List[int] = []
+    for value in raw_ids:
+        if isinstance(value, bool):
+            normalized.append(int(value))
+            continue
+        if isinstance(value, int):
+            if _INT64_MIN <= value <= _INT64_MAX:
+                normalized.append(int(value))
+            else:
+                normalized.append(_hash_to_int64(value))
+            continue
+        try:
+            if hasattr(value, "item"):
+                scalar = value.item()
+                if isinstance(scalar, (int, bool)):
+                    if _INT64_MIN <= int(scalar) <= _INT64_MAX:
+                        normalized.append(int(scalar))
+                    else:
+                        normalized.append(_hash_to_int64(scalar))
+                    continue
+                if isinstance(scalar, float) and scalar.is_integer():
+                    normalized.append(int(scalar))
+                    continue
+            if isinstance(value, float) and value.is_integer():
+                normalized.append(int(value))
+                continue
+        except Exception:
+            pass
+        normalized.append(_hash_to_int64(value))
+    return normalized
 
 
 def _alias_module(module, target_name: str, replace_existing: bool) -> None:
@@ -498,6 +555,8 @@ def run_inference(config: SniffConfig) -> None:
         queue_size=config.capture.queue_size,
         write_batch_size=config.output.write_batch_size,
         min_bucket_size=config.capture.min_bucket_size,
+        capture_pre_rope=config.capture.capture_pre_rope,
+        capture_token_strings=config.capture.capture_token_strings,
         metadata={
             "source_dataset": config.dataset.path,
             "dataset_name": config.dataset.name or "",
@@ -524,6 +583,15 @@ def run_inference(config: SniffConfig) -> None:
                     max_length=config.tokenizer.max_length,
                 )
                 batch_example_ids = batch["example_ids"]
+                if config.capture.capture_token_strings:
+                    input_ids = encodings.get("input_ids")
+                    if input_ids is None:
+                        raise ValueError("Tokenizer did not return input_ids required for token string capture.")
+                    token_id_rows = input_ids.tolist()
+                    token_strings = [
+                        tokenizer.convert_ids_to_tokens(row, skip_special_tokens=False) for row in token_id_rows
+                    ]
+                    set_active_token_strings(token_strings)
                 attention_mask = encodings.get("attention_mask")
                 if attention_mask is not None:
                     valid_lengths = attention_mask.sum(dim=1).tolist()

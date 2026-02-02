@@ -51,6 +51,7 @@ class CaptureRow:
     position: int
     vector: Union["np.ndarray", "torch.Tensor", Sequence[float]]
     sliding_window: Optional[int]
+    token_str: Optional[str] = None
 
     @property
     def config_name(self) -> str:
@@ -68,6 +69,7 @@ class CaptureBatch:
     positions: "np.ndarray"
     vectors: "np.ndarray"
     sliding_window: Optional[int]
+    token_strings: Optional[Sequence[str]] = None
 
     @property
     def config_name(self) -> str:
@@ -162,6 +164,7 @@ class DatasetSaver:
         self._readme = DatasetReadme(self.readme_path, self.root, dataset_name)
         self._write_batch_size = max(1, int(write_batch_size))
         self._pending: Dict[Tuple[str, str], Dict[str, List]] = {}
+        self._token_columns: Dict[Tuple[str, str], bool] = {}
         self._state_path = self.root / "_saver_state.json"
         self._load_state()
         for model_name in list(self._model_metadata.keys()):
@@ -186,6 +189,7 @@ class DatasetSaver:
                 positions=np.asarray([row.position], dtype=np.int64),
                 vectors=np.asarray([vector], dtype=np.float32),
                 sliding_window=row.sliding_window,
+                token_strings=[row.token_str] if row.token_str is not None else None,
             )
             self.add_batch(batch)
 
@@ -199,6 +203,9 @@ class DatasetSaver:
         row_count = buckets.shape[0]
         if row_count == 0:
             return
+        token_strings_raw = batch.token_strings
+        if token_strings_raw is not None and len(token_strings_raw) != row_count:
+            raise ValueError("token_strings length must match number of rows in CaptureBatch.")
         if not (example_ids.shape[0] == positions.shape[0] == row_count == vectors.shape[0]):
             raise ValueError("CaptureBatch columns must share the same length.")
 
@@ -230,6 +237,21 @@ class DatasetSaver:
             else [None] * buckets.shape[0]
         )
 
+        token_strings: Optional[List[Optional[str]]] = None
+        has_tokens = token_strings_raw is not None
+        token_policy = self._token_columns.get(key)
+        if token_policy is None:
+            self._token_columns[key] = has_tokens
+        elif token_policy and not has_tokens:
+            token_strings = [None] * buckets.shape[0]
+            has_tokens = True
+        elif not token_policy and has_tokens:
+            raise ValueError(
+                f"Token strings provided for {key} after writing data without token strings."
+            )
+        if has_tokens and token_strings is None:
+            token_strings = np.asarray(token_strings_raw, dtype=object)[keep_mask].tolist()
+
         columns = {
             "bucket": buckets.tolist(),
             "example_id": example_ids.tolist(),
@@ -237,6 +259,8 @@ class DatasetSaver:
             "vector": [np.copy(vec) for vec in vectors],
             "sliding_window": sliding_window_values,
         }
+        if token_strings is not None:
+            columns["token_str"] = token_strings
 
         self._models.add(split)
         self._config_splits.setdefault(config, set()).add(storage_split)
@@ -248,6 +272,8 @@ class DatasetSaver:
     def _append_pending(self, key: Tuple[str, str], columns: Dict[str, List]) -> None:
         pending = self._pending.setdefault(key, self._empty_pending())
         for name, values in columns.items():
+            if name not in pending:
+                pending[name] = []
             pending[name].extend(values)
         if len(pending["vector"]) >= self._write_batch_size:
             self._flush_pending(key)
@@ -259,15 +285,16 @@ class DatasetSaver:
         storage_split, config = key
         sink = self._sinks.setdefault(key, self._create_sink(storage_split, config))
         vector_array = _vectors_to_fixed_list(pending["vector"])
-        table = pa.table(
-            {
-                "bucket": pa.array(pending["bucket"], type=pa.int32()),
-                "example_id": pa.array(pending["example_id"], type=pa.int32()),
-                "position": pa.array(pending["position"], type=pa.int32()),
-                "vector": vector_array,
-                "sliding_window": pa.array(pending["sliding_window"]),
-            }
-        )
+        data = {
+            "bucket": pa.array(pending["bucket"], type=pa.int32()),
+            "example_id": pa.array(pending["example_id"], type=pa.int32()),
+            "position": pa.array(pending["position"], type=pa.int32()),
+            "vector": vector_array,
+            "sliding_window": pa.array(pending["sliding_window"]),
+        }
+        if "token_str" in pending:
+            data["token_str"] = pa.array(pending["token_str"], type=pa.string())
+        table = pa.table(data)
         sink.write(table)
         for values in pending.values():
             values.clear()

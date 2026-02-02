@@ -15,7 +15,7 @@ model:
 
 tokenizer:
   name: HuggingFaceTB/SmolLM2-360M
-  max_length: 8192
+  max_length: 512
   padding: longest
 
 inference:
@@ -27,12 +27,12 @@ capture:
   capture_keys: true
   layers: null
   heads: null
-  min_bucket_size: 128
+  min_bucket_size: 32
   sampler:
-    type: log_uniform
-    base_rate: 3.0
+    type: all
+  capture_token_strings: true
 
 output:
   data_root: data/sniffed-qk
   readme_path: README.md
-  hf_repo_id: viktoroo/sniffed-qk-smollm2-360m
+  hf_repo_id: viktoroo/sniffed-qk-smollm2-360m-tr512

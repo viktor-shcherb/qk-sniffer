@@ -199,18 +199,18 @@ class GlmAttention(nn.Module):
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
         sniffer = get_active_sniffer()
+        capture_pre_rope = False
+        positions = None
         if sniffer is not None:
+            capture_pre_rope = bool(getattr(sniffer.config, "capture_pre_rope", False))
             positions = compute_positions(
                 batch_size=query_states.shape[0],
                 seq_len=query_states.shape[2],
                 device=query_states.device,
                 cache_position=cache_position,
             )
-            if positions is not None:
+            if capture_pre_rope:
                 sniffer.capture(
                     layer_idx=self.layer_idx or 0,
                     query_states=query_states,
@@ -218,6 +218,18 @@ class GlmAttention(nn.Module):
                     positions=positions,
                     sliding_window=None,
                 )
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if sniffer is not None and not capture_pre_rope:
+            sniffer.capture(
+                layer_idx=self.layer_idx or 0,
+                query_states=query_states,
+                key_states=key_states,
+                positions=positions,
+                sliding_window=None,
+            )
 
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
