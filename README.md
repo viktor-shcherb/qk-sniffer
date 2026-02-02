@@ -52,7 +52,7 @@
    The CLI patches local modeling files into `transformers`, downloads the latest dataset snapshot (if `hf_repo_id` is set), runs inference, writes captures directly into that synced copy, then uploads the result.
 
 ## Key Configuration Notes
-- `dataset.*` maps directly to `datasets.load_dataset`. Set `max_samples` for dry runs.
+- `dataset.*` maps directly to `datasets.load_dataset`. Set `max_samples` for dry runs. Use `streaming: true` to stream without downloading the full split; when streaming, `max_samples` stops after the first *N* examples.
 - `model.*`/`tokenizer.*` feed `AutoModelForCausalLM` and `AutoTokenizer`. `device_map=auto` works well for multi-GPU.
 - `capture.*`
   - `layers`, `heads` accept Python-style integer lists; omit to capture every head.

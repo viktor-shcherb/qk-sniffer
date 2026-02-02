@@ -5,34 +5,31 @@ dataset:
   text_column: text
   id_column: null
   max_samples: 10000
-
+  streaming: true
 model:
   name: HuggingFaceTB/SmolLM2-360M
   revision: main
   dtype: bfloat16
   device_map: auto
   trust_remote_code: false
-
 tokenizer:
   name: HuggingFaceTB/SmolLM2-360M
   max_length: 512
   padding: longest
-
 inference:
   batch_size: 8
   autocast_dtype: bfloat16
-
 capture:
   capture_queries: true
   capture_keys: true
-  layers: [6]
+  layers:
+  - 6
   heads: null
   min_bucket_size: 32
   sampler:
     type: all
   capture_pre_rope: true
   capture_token_strings: true
-
 output:
   data_root: data/sniffed-qk
   readme_path: README.md

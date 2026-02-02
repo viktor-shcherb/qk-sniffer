@@ -19,7 +19,7 @@ from tqdm.auto import tqdm
 
 import torch
 import yaml
-from datasets import Dataset, load_dataset
+from datasets import Dataset, IterableDataset, load_dataset
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.errors import RepositoryNotFoundError, HfHubHTTPError
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
@@ -66,6 +66,7 @@ class DatasetSettings:
     text_column: str = "text"
     id_column: Optional[str] = None
     max_samples: Optional[int] = None
+    streaming: bool = False
 
 
 @dataclass
@@ -166,7 +167,12 @@ def _absolute_path(path: Path) -> Path:
     return (Path.cwd() / expanded).resolve()
 
 
-def load_hf_dataset(settings: DatasetSettings) -> Dataset:
+def load_hf_dataset(settings: DatasetSettings) -> Dataset | IterableDataset:
+    if settings.streaming:
+        dataset = load_dataset(settings.path, settings.name, split=settings.split, streaming=True)
+        if settings.max_samples is not None:
+            dataset = dataset.take(settings.max_samples)
+        return dataset
     dataset = load_dataset(settings.path, settings.name, split=settings.split)
     if settings.max_samples is not None:
         dataset = dataset.select(range(min(settings.max_samples, len(dataset))))
@@ -256,10 +262,33 @@ def build_sampler_factory(settings: SamplerSettings, *, min_bucket_size: int):
     raise ValueError(f"Unsupported sampler type '{settings.type}'.")
 
 
-def batch_iter(dataset: Dataset, settings: DatasetSettings, batch_size: int) -> Iterable[Dict[str, Any]]:
-    size = len(dataset)
+def batch_iter(dataset: Dataset | IterableDataset, settings: DatasetSettings, batch_size: int) -> Iterable[Dict[str, Any]]:
     text_col = settings.text_column
     id_col = settings.id_column
+    if isinstance(dataset, IterableDataset):
+        texts: List[str] = []
+        raw_ids: List[Any] = []
+        ids: List[int] = []
+        index = 0
+        for row in dataset:
+            texts.append(row[text_col])
+            if id_col:
+                raw_ids.append(row[id_col])
+            else:
+                ids.append(index)
+                index += 1
+            if len(texts) >= batch_size:
+                batch_ids = _normalize_example_ids(raw_ids) if id_col else ids
+                yield {"texts": texts, "example_ids": batch_ids}
+                texts = []
+                raw_ids = []
+                ids = []
+        if texts:
+            batch_ids = _normalize_example_ids(raw_ids) if id_col else ids
+            yield {"texts": texts, "example_ids": batch_ids}
+        return
+
+    size = len(dataset)
     for start in range(0, size, batch_size):
         slice_ = dataset[start : start + batch_size]
         texts = slice_[text_col]
@@ -568,7 +597,13 @@ def run_inference(config: SniffConfig) -> None:
     autocast_dtype = resolve_dtype(config.inference.autocast_dtype)
     print("Model device:", primary_device)
 
-    progress = tqdm(total=len(dataset), desc="Capturing", unit="rows")
+    total_rows: Optional[int] = None
+    if isinstance(dataset, IterableDataset):
+        if config.dataset.max_samples is not None:
+            total_rows = int(config.dataset.max_samples)
+    else:
+        total_rows = len(dataset)
+    progress = tqdm(total=total_rows, desc="Capturing", unit="rows")
     try:
         with activate_sniffer(sniffer_config):
             for batch in batch_iter(dataset, config.dataset, config.inference.batch_size):
