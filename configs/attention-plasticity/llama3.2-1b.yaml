@@ -21,6 +21,7 @@ tokenizer:
 inference:
   batch_size: 1
   autocast_dtype: bfloat16
+  debug_logging: true
 
 capture:
   capture_queries: true
