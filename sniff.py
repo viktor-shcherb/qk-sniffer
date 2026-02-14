@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib
 import json
 import os
@@ -106,6 +107,7 @@ class InferenceSettings:
     backend: str = "auto"
     debug_logging: bool = False
     debug_log_every_n_batches: int = 1
+    mps_cleanup_every_batches: int = 0
 
 
 @dataclass
@@ -1249,6 +1251,7 @@ def run_inference(config: SniffConfig) -> None:
         )
         local_example_index = 0
         batch_idx = 0
+        mps_cleanup_every = max(0, int(config.inference.mps_cleanup_every_batches))
         try:
             with activate_sniffer(sniffer_config) as active_sniffer:
                 flush_batch = getattr(active_sniffer, "flush_batch", None)
@@ -1385,6 +1388,17 @@ def run_inference(config: SniffConfig) -> None:
                             ),
                         )
                     progress.update(len(texts))
+                    if primary_device.type == "mps" and mps_cleanup_every > 0 and batch_idx % mps_cleanup_every == 0:
+                        cleanup_start = perf_counter()
+                        gc.collect()
+                        mps_backend = getattr(torch, "mps", None)
+                        if mps_backend is not None and hasattr(mps_backend, "empty_cache"):
+                            mps_backend.empty_cache()
+                        if debug_this_batch:
+                            _debug_log(
+                                True,
+                                f"batch {batch_idx}: mps cleanup in {perf_counter() - cleanup_start:.3f}s",
+                            )
                     if debug_this_batch:
                         _debug_log(
                             True,

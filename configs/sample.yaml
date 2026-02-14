@@ -25,6 +25,7 @@ inference:
   autocast_dtype: float16
   distributed: false
   backend: auto
+  debug_logging: true
 
 capture:
   capture_queries: true

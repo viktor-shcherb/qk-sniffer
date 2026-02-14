@@ -124,6 +124,7 @@ inference:
   batch_size: 2
   debug_logging: true
   debug_log_every_n_batches: 5
+  mps_cleanup_every_batches: 7
 capture:
   capture_queries: true
   capture_keys: true
@@ -136,3 +137,4 @@ output:
     config = sniff.load_config(config_path)
     assert config.inference.debug_logging is True
     assert config.inference.debug_log_every_n_batches == 5
+    assert config.inference.mps_cleanup_every_batches == 7
