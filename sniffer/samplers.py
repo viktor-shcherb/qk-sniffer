@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import math
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 
@@ -29,6 +29,17 @@ def _combine_seed(seed: int, value: int) -> int:
 
 
 class Sampler(ABC):
+    _cached_generator: Optional[torch.Generator] = None
+    _cached_generator_device: Optional[torch.device] = None
+
+    def _get_generator(self, device: torch.device, seed: int) -> torch.Generator:
+        """Return a reusable Generator for *device*, seeded with *seed*."""
+        if self._cached_generator is None or self._cached_generator_device != device:
+            self._cached_generator = torch.Generator(device=device)
+            self._cached_generator_device = device
+        self._cached_generator.manual_seed(seed)
+        return self._cached_generator
+
     @abstractmethod
     def sample_positions(
         self,
@@ -164,8 +175,7 @@ class LogUniformSampler(Sampler):
             torch.ones_like(denominator),
             torch.tensor(self.base_rate, device=device, dtype=torch.float32) / denominator,
         )
-        generator = torch.Generator(device=device)
-        generator.manual_seed(_batch_seed(example_id, layer_idx, vector_kind))
+        generator = self._get_generator(device, _batch_seed(example_id, layer_idx, vector_kind))
         random_values = torch.rand(probabilities.shape, generator=generator, device=device, dtype=torch.float32)
         return random_values < probabilities
 
@@ -217,8 +227,7 @@ class UniformSampler(Sampler):
         seq_len = positions.shape[0]
         device = positions.device
         probability = min(1.0, float(self.base_rate) / float(self.bucket_size))
-        generator = torch.Generator(device=device)
-        generator.manual_seed(_batch_seed(example_id, layer_idx, vector_kind))
+        generator = self._get_generator(device, _batch_seed(example_id, layer_idx, vector_kind))
         random_values = torch.rand(seq_len, generator=generator, device=device, dtype=torch.float32)
         return random_values < probability
 

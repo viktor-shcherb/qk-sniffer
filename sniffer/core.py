@@ -239,10 +239,8 @@ class Sniffer:
 
         device = states.device
         n_heads = len(head_indices_list)
+        all_heads = n_heads == num_heads
         head_idx_tensor = torch.tensor(list(head_indices_list), device=device, dtype=torch.int64)
-
-        # Extract states for all active heads at once: (batch, n_active, seq, dim)
-        active_states = states[:, head_idx_tensor]
 
         all_vectors: List[torch.Tensor] = []
         all_head_ids: List[torch.Tensor] = []
@@ -297,10 +295,11 @@ class Sniffer:
                 selected_pos = selected_pos[perm[:limit]]
                 K = limit
 
-            # Gather vectors for ALL heads at selected positions
-            # active_states[batch_idx]: (n_heads, seq, dim)
-            # active_states[batch_idx, :, selected_pos]: (n_heads, K, dim)
-            vectors = active_states[batch_idx, :, selected_pos]  # (n_heads, K, dim)
+            # Gather vectors: first select K positions (small), then select heads.
+            # states[batch_idx, :, selected_pos] is (total_heads, K, dim) — e.g. 4MB
+            # vs pre-gathering all heads at all positions — e.g. 512MB.
+            at_pos = states[batch_idx, :, selected_pos]  # (total_heads, K, dim)
+            vectors = at_pos if all_heads else at_pos[head_idx_tensor]  # (n_heads, K, dim)
             vectors_flat = vectors.reshape(n_heads * K, -1)
 
             # Build head indices: [h0, h0, ..., h1, h1, ...]
