@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import re
 import json
-from collections import Counter, defaultdict
+import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Literal, Optional, Sequence, Set, Tuple, Union
@@ -27,20 +27,7 @@ VectorKind = Literal["k", "q"]
 
 @dataclass(slots=True)
 class CaptureRow:
-    """
-    Container describing a single query/key sample.
-
-    Attributes:
-        model_name: Acts as the HF dataset split (e.g. ``gemma3-9b``).
-        layer_idx: Decoder layer index.
-        head_idx: Attention head index within the layer.
-        vector_kind: ``"q"`` or ``"k"`` – appended to the config name.
-        bucket: Log2 bucket id (or any other integer grouping).
-        example_id: Identifier of the example/batch item.
-        position: Position of the token within the example sequence.
-        vector: numpy array, tensor, or sequence of floats representing the vector.
-        sliding_window: Size of the sliding window (``None`` for fully causal attention).
-    """
+    """Container describing a single query/key sample."""
 
     model_name: str
     layer_idx: int
@@ -77,14 +64,13 @@ class CaptureBatch:
 
 
 class _ParquetSink:
-    """Keeps a Parquet writer open for a split/config pair."""
+    """Keeps a Parquet writer open for a config."""
 
-    def __init__(self, root: Path, split: str, config_name: str, compression: str = "zstd"):
+    def __init__(self, root: Path, config_name: str, compression: str = "zstd"):
         self.root = root
-        self.split = split
         self.config_name = config_name
         self.compression = compression
-        self.dir_path = self.root / split / config_name
+        self.dir_path = self.root / config_name
         self.dir_path.mkdir(parents=True, exist_ok=True)
         self.file_path = self.dir_path / "data.parquet"
         self._writer: Optional[pq.ParquetWriter] = None
@@ -117,12 +103,7 @@ class _ParquetSink:
 
 
 class DatasetSaver:
-    """
-    Streams capture rows into Parquet files organised as ``data/{split}/{config}/data.parquet``.
-
-    The split name corresponds to the model name, while the config name encodes the layer/head and
-    whether the vectors are keys or queries (e.g. ``l03h07q``).
-    """
+    """Streams capture rows into ``<root>/<config>/data.parquet`` files."""
 
     def __init__(
         self,
@@ -136,39 +117,32 @@ class DatasetSaver:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.compression = compression
-        raw_readme_path = Path(readme_path).expanduser()
-        if raw_readme_path.is_absolute():
-            resolved_readme_path = raw_readme_path
-        else:
-            resolved_readme_path = (self.root / raw_readme_path).expanduser()
-        self.readme_path = resolved_readme_path
-        seen_readme_paths = {self.readme_path.resolve()}
+
+        # README is always rooted at dataset root.
+        self.readme_path = self.root / "README.md"
+        self._readme = DatasetReadme(self.readme_path, dataset_name)
         mirror_readmes: List[DatasetReadme] = []
-        for extra_path in mirror_readme_paths or []:
-            extra = Path(extra_path).expanduser()
-            if not extra.is_absolute():
-                extra = (self.root / extra).expanduser()
-            resolved_extra = extra.resolve()
-            if resolved_extra in seen_readme_paths:
-                continue
-            mirror_readmes.append(DatasetReadme(resolved_extra, self.root, dataset_name))
-            seen_readme_paths.add(resolved_extra)
+        for path in mirror_readme_paths or []:
+            mirror_path = Path(path).expanduser()
+            if not mirror_path.is_absolute():
+                mirror_path = self.root / mirror_path
+            mirror_readmes.append(DatasetReadme(mirror_path, dataset_name))
         self._mirror_readmes = mirror_readmes
-        self._sinks: Dict[Tuple[str, str], _ParquetSink] = {}
-        self._config_splits: Dict[str, Set[str]] = {}
-        self._models: Set[str] = set()
-        self._sanitized_splits: Dict[str, str] = {}
-        self._position_cache: Dict[Tuple[str, str], Set[Tuple[int, int]]] = {}
-        self._model_metadata: Dict[str, Dict[str, Union[str, int, float]]] = {}
-        self._bucket_counts: Dict[str, Counter] = defaultdict(Counter)
-        self._readme = DatasetReadme(self.readme_path, self.root, dataset_name)
+
+        self._sinks: Dict[str, _ParquetSink] = {}
+        self._config_names: Set[str] = set()
+        self._position_cache: Dict[str, Set[Tuple[int, int]]] = {}
+        self._bucket_counts: Counter = Counter()
+
+        self._model_name: Optional[str] = None
+        self._model_metadata: Dict[str, Union[str, int, float]] = {}
+
         self._write_batch_size = max(1, int(write_batch_size))
-        self._pending: Dict[Tuple[str, str], Dict[str, List]] = {}
-        self._token_columns: Dict[Tuple[str, str], bool] = {}
+        self._pending: Dict[str, Dict[str, List]] = {}
+        self._token_columns: Dict[str, bool] = {}
+
         self._state_path = self.root / "_saver_state.json"
         self._load_state()
-        for model_name in list(self._model_metadata.keys()):
-            self._ensure_sanitized_metadata(model_name)
         self._seed_existing_entries()
 
     def add(self, row: CaptureRow) -> None:
@@ -196,25 +170,28 @@ class DatasetSaver:
     def add_batch(self, batch: CaptureBatch) -> None:
         if np is None:
             raise RuntimeError("NumPy is required to convert vectors for storage.")
+
+        self._set_model_name(batch.model_name)
+
         buckets = np.asarray(batch.buckets, dtype=np.int64).reshape(-1)
         example_ids = np.asarray(batch.example_ids, dtype=np.int64).reshape(-1)
         positions = np.asarray(batch.positions, dtype=np.int64).reshape(-1)
         vectors = np.asarray(batch.vectors, dtype=np.float32)
+
         row_count = buckets.shape[0]
         if row_count == 0:
             return
+
         token_strings_raw = batch.token_strings
         if token_strings_raw is not None and len(token_strings_raw) != row_count:
             raise ValueError("token_strings length must match number of rows in CaptureBatch.")
         if not (example_ids.shape[0] == positions.shape[0] == row_count == vectors.shape[0]):
             raise ValueError("CaptureBatch columns must share the same length.")
 
-        split = batch.model_name
-        storage_split = self._sanitized_splits.setdefault(split, _sanitize_split(split))
-        self._ensure_sanitized_metadata(split)
         config = batch.config_name
-        key = (storage_split, config)
-        position_cache = self._position_cache.setdefault(key, self._load_existing_positions(storage_split, config))
+        self._config_names.add(config)
+        key = config
+        position_cache = self._position_cache.setdefault(key, self._load_existing_positions(config))
 
         keep_mask = np.ones(row_count, dtype=bool)
         for idx in range(row_count):
@@ -246,9 +223,7 @@ class DatasetSaver:
             token_strings = [None] * buckets.shape[0]
             has_tokens = True
         elif not token_policy and has_tokens:
-            raise ValueError(
-                f"Token strings provided for {key} after writing data without token strings."
-            )
+            raise ValueError(f"Token strings provided for {key} after writing data without token strings.")
         if has_tokens and token_strings is None:
             token_strings = np.asarray(token_strings_raw, dtype=object)[keep_mask].tolist()
 
@@ -262,14 +237,12 @@ class DatasetSaver:
         if token_strings is not None:
             columns["token_str"] = token_strings
 
-        self._models.add(split)
-        self._config_splits.setdefault(config, set()).add(storage_split)
         for bucket in buckets.tolist():
-            self._bucket_counts[split][bucket] += 1
+            self._bucket_counts[int(bucket)] += 1
 
         self._append_pending(key, columns)
 
-    def _append_pending(self, key: Tuple[str, str], columns: Dict[str, List]) -> None:
+    def _append_pending(self, key: str, columns: Dict[str, List]) -> None:
         pending = self._pending.setdefault(key, self._empty_pending())
         for name, values in columns.items():
             if name not in pending:
@@ -278,12 +251,12 @@ class DatasetSaver:
         if len(pending["vector"]) >= self._write_batch_size:
             self._flush_pending(key)
 
-    def _flush_pending(self, key: Tuple[str, str]) -> None:
+    def _flush_pending(self, key: str) -> None:
         pending = self._pending.get(key)
         if not pending or not pending["vector"]:
             return
-        storage_split, config = key
-        sink = self._sinks.setdefault(key, self._create_sink(storage_split, config))
+
+        sink = self._sinks.setdefault(key, self._create_sink(key))
         vector_array = _vectors_to_fixed_list(pending["vector"])
         data = {
             "bucket": pa.array(pending["bucket"], type=pa.int32()),
@@ -306,11 +279,14 @@ class DatasetSaver:
     def close(self) -> None:
         for key in list(self._pending.keys()):
             self._flush_pending(key)
+
         current_sinks = list(self._sinks.values())
         for sink in current_sinks:
             sink.close()
+
         self._sinks.clear()
         self._pending.clear()
+
         self._write_readme()
         self._save_state()
 
@@ -321,42 +297,52 @@ class DatasetSaver:
         self.close()
 
     def register_model_metadata(self, model_name: str, metadata: Dict[str, Union[str, int, float]]) -> None:
-        sanitized = self._ensure_sanitized_metadata(model_name)
-        self._model_metadata.setdefault(model_name, {}).update(metadata)
-        self._models.add(model_name)
-        (self.root / sanitized).mkdir(parents=True, exist_ok=True)
+        self._set_model_name(model_name)
+        self._model_metadata.update(metadata)
+
+    def _set_model_name(self, model_name: str) -> None:
+        if self._model_name is None:
+            self._model_name = model_name
+            return
+        if self._model_name != model_name:
+            raise ValueError(
+                "Dataset branch layout only supports one model per branch. "
+                f"Existing model is '{self._model_name}', got '{model_name}'."
+            )
 
     def _write_readme(self) -> None:
-        self._readme.write(self._config_splits, self._models, self._model_metadata, self._bucket_counts)
+        self._readme.write(
+            model_name=self._model_name,
+            metadata=dict(self._model_metadata),
+            config_names=sorted(self._config_names),
+            bucket_counts={int(k): int(v) for k, v in self._bucket_counts.items()},
+        )
         for mirror in self._mirror_readmes:
-            mirror.write(self._config_splits, self._models, self._model_metadata, self._bucket_counts)
+            mirror.write(
+                model_name=self._model_name,
+                metadata=dict(self._model_metadata),
+                config_names=sorted(self._config_names),
+                bucket_counts={int(k): int(v) for k, v in self._bucket_counts.items()},
+            )
 
     def _seed_existing_entries(self) -> None:
-        front_matter = self._readme.front_matter or {}
-        for model_entry in front_matter.get("models", []):
-            name = model_entry.get("name")
-            if name:
-                self._models.add(name)
         if not self.root.exists():
             return
-        for split_dir in self.root.iterdir():
-            if not split_dir.is_dir():
+        for config_dir in self.root.iterdir():
+            if not config_dir.is_dir():
                 continue
-            split_name = split_dir.name
-            for config_dir in split_dir.iterdir():
-                if not config_dir.is_dir():
-                    continue
-                data_file = config_dir / "data.parquet"
-                if not data_file.exists():
-                    continue
-                self._config_splits.setdefault(config_dir.name, set()).add(split_name)
+            if not _CONFIG_NAME_RE.match(config_dir.name):
+                continue
+            data_file = config_dir / "data.parquet"
+            if data_file.exists():
+                self._config_names.add(config_dir.name)
 
-    def _create_sink(self, storage_split: str, config: str) -> _ParquetSink:
-        return _ParquetSink(self.root, storage_split, config, compression=self.compression)
+    def _create_sink(self, config: str) -> _ParquetSink:
+        return _ParquetSink(self.root, config, compression=self.compression)
 
-    def _load_existing_positions(self, storage_split: str, config: str) -> Set[Tuple[int, int]]:
+    def _load_existing_positions(self, config: str) -> Set[Tuple[int, int]]:
         cache: Set[Tuple[int, int]] = set()
-        data_path = self.root / storage_split / config / "data.parquet"
+        data_path = self.root / config / "data.parquet"
         if not data_path.exists():
             return cache
         try:
@@ -377,52 +363,61 @@ class DatasetSaver:
         except Exception:
             return
 
-        metadata = data.get("model_metadata", {})
+        # New format.
+        model_name = data.get("model_name")
+        if isinstance(model_name, str):
+            self._model_name = model_name
+        metadata = data.get("model_metadata")
         if isinstance(metadata, dict):
-            for model_name, meta in metadata.items():
-                if isinstance(meta, dict):
-                    self._model_metadata.setdefault(model_name, {}).update(meta)
-                    self._models.add(model_name)
-                    self._ensure_sanitized_metadata(model_name)
+            for key, value in metadata.items():
+                if isinstance(key, str) and isinstance(value, (str, int, float)):
+                    self._model_metadata[key] = value
 
-        bucket_counts = data.get("bucket_counts", {})
+        bucket_counts = data.get("bucket_counts")
         if isinstance(bucket_counts, dict):
-            for model_name, counts in bucket_counts.items():
-                if not isinstance(counts, dict):
+            for bucket_key, value in bucket_counts.items():
+                try:
+                    bucket_idx = int(bucket_key)
+                    self._bucket_counts[bucket_idx] = int(value)
+                except (TypeError, ValueError):
                     continue
-                counter = Counter()
-                for bucket_key, value in counts.items():
-                    try:
-                        bucket_idx = int(bucket_key)
-                        counter[bucket_idx] = int(value)
-                    except (TypeError, ValueError):
-                        continue
-                if counter:
-                    self._bucket_counts[model_name].update(counter)
-                    self._models.add(model_name)
-                    self._ensure_sanitized_metadata(model_name)
+
+        # Best-effort old format fallback.
+        if self._model_name is None:
+            old_metadata = data.get("model_metadata")
+            if isinstance(old_metadata, dict) and old_metadata:
+                first_key = next(iter(old_metadata.keys()))
+                first_meta = old_metadata.get(first_key)
+                if isinstance(first_key, str) and isinstance(first_meta, dict):
+                    self._model_name = first_key
+                    for key, value in first_meta.items():
+                        if isinstance(key, str) and isinstance(value, (str, int, float)):
+                            self._model_metadata[key] = value
+        if not self._bucket_counts:
+            old_bucket_counts = data.get("bucket_counts")
+            if isinstance(old_bucket_counts, dict) and old_bucket_counts:
+                if self._model_name and isinstance(old_bucket_counts.get(self._model_name), dict):
+                    old_counts = old_bucket_counts[self._model_name]
+                else:
+                    first_value = next(iter(old_bucket_counts.values()))
+                    old_counts = first_value if isinstance(first_value, dict) else {}
+                if isinstance(old_counts, dict):
+                    for bucket_key, value in old_counts.items():
+                        try:
+                            self._bucket_counts[int(bucket_key)] = int(value)
+                        except (TypeError, ValueError):
+                            continue
 
     def _save_state(self) -> None:
-        bucket_counts = {
-            model: {str(bucket): int(count) for bucket, count in counts.items()}
-            for model, counts in self._bucket_counts.items()
-            if counts
-        }
         state = {
+            "model_name": self._model_name,
             "model_metadata": self._model_metadata,
-            "bucket_counts": bucket_counts,
+            "bucket_counts": {str(bucket): int(count) for bucket, count in self._bucket_counts.items() if count},
         }
         try:
             self._state_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
         except Exception:
             pass
-
-    def _ensure_sanitized_metadata(self, model_name: str) -> str:
-        sanitized = self._sanitized_splits.setdefault(model_name, _sanitize_split(model_name))
-        meta = self._model_metadata.setdefault(model_name, {})
-        if meta.get("sanitized_split") != sanitized:
-            meta["sanitized_split"] = sanitized
-        return sanitized
 
 
 def _to_numpy(vector: Union["np.ndarray", "torch.Tensor", Sequence[float]]) -> "np.ndarray":
@@ -444,8 +439,4 @@ def _vectors_to_fixed_list(vectors: List["np.ndarray"]) -> pa.FixedSizeListArray
     return pa.FixedSizeListArray.from_arrays(values, list_size)
 
 
-def _sanitize_split(split: str) -> str:
-    return _SPLIT_SANITIZE_RE.sub("_", split)
-
-
-_SPLIT_SANITIZE_RE = re.compile(r"\W")
+_CONFIG_NAME_RE = re.compile(r"^l\d{2}h\d{2}[qk]$")

@@ -1,0 +1,43 @@
+dataset:
+  path: viktoroo/longbench-pro-128k-plus
+  name: null
+  split: test
+  text_column: text
+  id_column: id
+  max_samples: null
+
+model:
+  name: mistralai/Ministral-3-8B-Base-2512
+  revision: main
+  dtype: bfloat16
+  device_map: auto
+  trust_remote_code: false
+
+tokenizer:
+  name: mistralai/Ministral-3-8B-Base-2512
+  max_length: 131072
+  padding: longest
+
+inference:
+  batch_size: 1
+  autocast_dtype: bfloat16
+
+capture:
+  capture_queries: true
+  capture_keys: true
+  layers: null
+  heads: null
+  head_sampling:
+    count: 300
+    seed: 0
+  full_attention_only: true
+  capture_pre_rope: false
+  min_bucket_size: 2048
+  sampler:
+    type: uniform
+    base_rate: 10.0
+
+output:
+  data_root: data/attention-plasticity
+  readme_path: README.md
+  hf_repo_id: viktoroo/sniffed-qk-ministral3-8b-longbench-pro-128k-plus

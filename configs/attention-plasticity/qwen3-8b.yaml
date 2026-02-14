@@ -1,10 +1,10 @@
 dataset:
-  path: viktoroo/longbench2-128k-plus
+  path: viktoroo/longbench-pro-128k-plus
   name: null
-  split: train
+  split: test
   text_column: text
   id_column: id
-  max_samples: 2048
+  max_samples: null
 
 model:
   name: Qwen/Qwen3-8B
@@ -32,12 +32,17 @@ capture:
   capture_keys: true
   layers: null
   heads: null
-  min_bucket_size: 8192
+  head_sampling:
+    count: 300
+    seed: 0
+  full_attention_only: true
+  capture_pre_rope: false
+  min_bucket_size: 2048
   sampler:
     type: uniform
-    base_rate: 3.0
+    base_rate: 10.0
 
 output:
-  data_root: data/sniffed-qk-qwen3-8b-yarn4x
+  data_root: data/attention-plasticity
   readme_path: README.md
-  hf_repo_id: viktoroo/sniffed-qk-qwen3-8b-yarn4x
+  hf_repo_id: viktoroo/sniffed-qk-qwen3-8b-longbench-pro-128k-plus

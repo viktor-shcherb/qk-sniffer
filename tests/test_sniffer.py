@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import re
-from pathlib import Path
-
 import pyarrow.parquet as pq
 import pytest
 import torch
-import yaml
 
 from sniffer import (
     AllSampler,
@@ -72,7 +68,7 @@ def test_sniffer_captures_qk(tmp_path):
     )
     sniffer.close()
 
-    base = tmp_path / "data" / "meta_llama3_8b"
+    base = tmp_path / "data"
     q_path = base / "l00h00q" / "data.parquet"
     k_path = base / "l00h00k" / "data.parquet"
 
@@ -111,7 +107,7 @@ def test_sniffer_respects_cache_position(tmp_path):
     )
     sniffer.close()
 
-    q_path = tmp_path / "data" / "meta_llama3_8b" / "l01h00q" / "data.parquet"
+    q_path = tmp_path / "data" / "l01h00q" / "data.parquet"
     table = pq.read_table(q_path)
     assert table.column("position").to_pylist() == [10, 11]
     assert table.column("sliding_window").to_pylist() == [128, 128]
@@ -138,7 +134,7 @@ def test_sniffer_custom_example_ids(tmp_path):
     )
     sniffer.close()
 
-    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    q_path = tmp_path / "data" / "l00h00q" / "data.parquet"
     table = pq.read_table(q_path)
     assert table.column("example_id").to_pylist() == [42]
 
@@ -159,7 +155,7 @@ def test_sniffer_respects_sequence_lengths(tmp_path):
     sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
     sniffer.close()
 
-    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    q_path = tmp_path / "data" / "l00h00q" / "data.parquet"
     table = pq.read_table(q_path)
     assert table.num_rows == 2
     assert table.column("position").to_pylist() == [0, 1]
@@ -181,7 +177,7 @@ def test_sniffer_captures_token_strings(tmp_path):
     sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
     sniffer.close()
 
-    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    q_path = tmp_path / "data" / "l00h00q" / "data.parquet"
     table = pq.read_table(q_path)
     assert "token_str" in table.schema.names
     assert table.column("token_str").to_pylist() == ["A", "B", "C"]
@@ -203,7 +199,7 @@ def test_sniffer_all_sampler_uses_uniform_buckets(tmp_path):
     sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
     sniffer.close()
 
-    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    q_path = tmp_path / "data" / "l00h00q" / "data.parquet"
     table = pq.read_table(q_path)
     assert table.num_rows == 4
     assert table.column("position").to_pylist() == [256, 257, 258, 259]
@@ -225,7 +221,7 @@ def test_sniffer_max_rows_per_batch(tmp_path):
     sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
     sniffer.close()
 
-    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    q_path = tmp_path / "data" / "l00h00q" / "data.parquet"
     table = pq.read_table(q_path)
     assert table.num_rows == 1
 
@@ -249,10 +245,66 @@ def test_sniffer_respects_layer_and_head_filters(tmp_path):
     sniffer.capture(layer_idx=1, query_states=states, key_states=states, positions=positions, sliding_window=None)
     sniffer.close()
 
-    base = tmp_path / "data" / "meta_llama3_8b"
+    base = tmp_path / "data"
     assert not (base / "l00h00q").exists()
     assert (base / "l01h00q").exists()
     assert not (base / "l01h01q").exists()
+
+
+def test_sniffer_sampled_query_heads_drive_key_head_capture(tmp_path):
+    config = SnifferConfig(
+        model_name="meta/llama3-8b",
+        data_root=tmp_path / "data",
+        readme_path=tmp_path / "README.md",
+        sampled_query_heads={0: {1, 2}},
+        sampled_key_heads={0: {0, 1}},
+        sampler_factory=lambda: AlwaysSampler(),
+        min_bucket_size=1,
+    )
+    sniffer = Sniffer(config)
+    query_states = torch.randn(1, 4, 2, 4)
+    key_states = torch.randn(1, 2, 2, 4)
+    positions = compute_positions(batch_size=1, seq_len=2, device=query_states.device, cache_position=None)
+
+    sniffer.capture(layer_idx=0, query_states=query_states, key_states=key_states, positions=positions, sliding_window=None)
+    sniffer.capture(layer_idx=1, query_states=query_states, key_states=key_states, positions=positions, sliding_window=None)
+    sniffer.close()
+
+    base = tmp_path / "data"
+    assert (base / "l00h01q").exists()
+    assert (base / "l00h02q").exists()
+    assert not (base / "l00h00q").exists()
+    assert not (base / "l00h03q").exists()
+    assert (base / "l00h00k").exists()
+    assert (base / "l00h01k").exists()
+    assert not (base / "l01h01q").exists()
+    assert not (base / "l01h00k").exists()
+
+
+def test_sniffer_full_attention_only_skips_sliding_window_capture(tmp_path):
+    config = SnifferConfig(
+        model_name="meta/llama3-8b",
+        data_root=tmp_path / "data",
+        readme_path=tmp_path / "README.md",
+        full_attention_only=True,
+        sampler_factory=lambda: AlwaysSampler(),
+        min_bucket_size=1,
+    )
+    sniffer = Sniffer(config)
+    states = torch.randn(1, 1, 2, 4)
+    positions = compute_positions(batch_size=1, seq_len=2, device=states.device, cache_position=None)
+
+    # Sliding-window capture should be ignored in full_attention_only mode.
+    sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=64)
+    # Global attention capture should still be recorded.
+    sniffer.capture(layer_idx=1, query_states=states, key_states=states, positions=positions, sliding_window=None)
+    sniffer.close()
+
+    base = tmp_path / "data"
+    assert not (base / "l00h00q").exists()
+    assert not (base / "l00h00k").exists()
+    assert (base / "l01h00q").exists()
+    assert (base / "l01h00k").exists()
 
 
 def test_sniffer_toggle_queries_vs_keys(tmp_path):
@@ -271,7 +323,7 @@ def test_sniffer_toggle_queries_vs_keys(tmp_path):
     sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
     sniffer.close()
 
-    base = tmp_path / "data" / "meta_llama3_8b"
+    base = tmp_path / "data"
     assert not (base / "l00h00q").exists()
     assert (base / "l00h00k").exists()
 
@@ -306,7 +358,7 @@ def test_set_active_example_ids_updates_current_session(tmp_path):
         states = torch.ones(1, 1, 1, 4)
         positions = compute_positions(batch_size=1, seq_len=1, device=states.device, cache_position=None)
         sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
-    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    q_path = tmp_path / "data" / "l00h00q" / "data.parquet"
     table = pq.read_table(q_path)
     assert table.column("example_id").to_pylist() == [99]
 
@@ -324,7 +376,7 @@ def test_set_active_sequence_lengths_updates_current_session(tmp_path):
         states = torch.ones(1, 1, 3, 4)
         positions = compute_positions(batch_size=1, seq_len=3, device=states.device, cache_position=None)
         sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
-    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    q_path = tmp_path / "data" / "l00h00q" / "data.parquet"
     table = pq.read_table(q_path)
     assert table.column("position").to_pylist() == [0]
 
@@ -343,7 +395,7 @@ def test_custom_sampler_drops_non_zero_buckets(tmp_path):
     sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
     sniffer.close()
 
-    base = tmp_path / "data" / "meta_llama3_8b"
+    base = tmp_path / "data"
     q_path = base / "l00h00q" / "data.parquet"
     table = pq.read_table(q_path)
     assert table.num_rows == 1  # only bucket 0 kept
@@ -362,7 +414,7 @@ def test_sniffer_default_min_bucket_size_groups_positions(tmp_path):
     sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
     sniffer.close()
 
-    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    q_path = tmp_path / "data" / "l00h00q" / "data.parquet"
     table = pq.read_table(q_path)
     assert table.column("bucket").to_pylist() == [7, 7, 7, 7, 8]
 
@@ -381,7 +433,7 @@ def test_sniffer_custom_min_bucket_size(tmp_path):
     sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
     sniffer.close()
 
-    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    q_path = tmp_path / "data" / "l00h00q" / "data.parquet"
     table = pq.read_table(q_path)
     assert table.column("bucket").to_pylist() == [2, 2, 2, 3]
 
@@ -400,7 +452,7 @@ def test_sniffer_min_bucket_size_rounds_up(tmp_path):
     sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
     sniffer.close()
 
-    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    q_path = tmp_path / "data" / "l00h00q" / "data.parquet"
     table = pq.read_table(q_path)
     assert table.column("bucket").to_pylist() == [8, 8, 9]
 
@@ -469,7 +521,7 @@ def test_sniffer_uniform_bucket_strategy(tmp_path):
     sniffer.capture(layer_idx=0, query_states=states, key_states=states, positions=positions, sliding_window=None)
     sniffer.close()
 
-    q_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    q_path = tmp_path / "data" / "l00h00q" / "data.parquet"
     table = pq.read_table(q_path)
     assert table.column("bucket").to_pylist() == [0, 0, 0, 1, 2]
 
@@ -505,7 +557,7 @@ def test_compute_positions_with_none_cache():
     assert torch.equal(positions, expected)
 
 
-def test_sniffer_multiple_models_share_dataset(tmp_path):
+def test_sniffer_rejects_multiple_models_in_same_data_root(tmp_path):
     data_root = tmp_path / "data"
     readme_path = tmp_path / "README.md"
 
@@ -530,29 +582,10 @@ def test_sniffer_multiple_models_share_dataset(tmp_path):
         sniffer.close()
 
     run_capture("meta/llama3-8b", 1.0)
-    run_capture("HuggingFaceTB/SmolLM2-360M", 2.0)
+    with pytest.raises(ValueError, match="one model per branch"):
+        run_capture("HuggingFaceTB/SmolLM2-360M", 2.0)
 
-    def sanitized_split(name: str) -> str:
-        return re.sub(r"\W", "_", name)
-
-    for model_name in ("meta/llama3-8b", "HuggingFaceTB/SmolLM2-360M"):
-        expected = data_root / sanitized_split(model_name) / "l00h00q" / "data.parquet"
-        assert expected.exists()
-
-    front_matter, _ = _read_front_matter(readme_path)
-    recorded_models = {entry["name"] for entry in front_matter["models"]}
-    assert "meta/llama3-8b" in recorded_models
-    assert "HuggingFaceTB/SmolLM2-360M" in recorded_models
-
-    configs = {entry["config_name"]: entry for entry in front_matter["configs"]}
-    all_entry = configs["all"]
-    splits = {item["split"] for item in all_entry["data_files"]}
-    assert sanitized_split("meta/llama3-8b") in splits
-    assert sanitized_split("HuggingFaceTB/SmolLM2-360M") in splits
-
-
-def _read_front_matter(path: Path) -> tuple[dict, str]:
-    content = path.read_text(encoding="utf-8")
-    assert content.startswith("---")
-    _, front_raw, body = content.split("---", 2)
-    return yaml.safe_load(front_raw.strip()), body
+    expected = data_root / "l00h00q" / "data.parquet"
+    assert expected.exists()
+    readme = (data_root / "README.md").read_text(encoding="utf-8")
+    assert "`model`: `meta/llama3-8b`" in readme

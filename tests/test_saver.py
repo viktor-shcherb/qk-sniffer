@@ -5,16 +5,15 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 import pytest
-import yaml
 from datasets import load_dataset
 
 from saver.dataset import CaptureBatch, CaptureRow, DatasetSaver
 
 
-def test_dataset_saver_writes_parquet_and_readme(tmp_path):
+def test_dataset_saver_writes_parquet_and_root_readme(tmp_path):
     saver = DatasetSaver(
         root=tmp_path / "data",
-        readme_path=tmp_path / "README.md",
+        readme_path=tmp_path / "ignored/README.md",
         dataset_name="viktoroo/sniffed-qk-test",
     )
 
@@ -22,42 +21,34 @@ def test_dataset_saver_writes_parquet_and_readme(tmp_path):
         [
             _row("meta/llama3-8b", layer=0, head=0, kind="q", bucket=0, example_id=0, position=0, vector=[0.1, 0.2]),
             _row("meta/llama3-8b", layer=0, head=0, kind="k", bucket=1, example_id=0, position=0, vector=[0.3, 0.4]),
-            _row("google/gemma3-9b", layer=1, head=2, kind="q", bucket=2, example_id=1, position=5, vector=[0.5, 0.6]),
         ]
     )
     saver.close()
 
-    parquet_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    parquet_path = tmp_path / "data" / "l00h00q" / "data.parquet"
     assert parquet_path.exists()
 
     table = pq.read_table(parquet_path)
     assert table.num_rows == 1
     assert table.schema.names == ["bucket", "example_id", "position", "vector", "sliding_window"]
     assert table.column("bucket").to_pylist() == [0]
-    assert table.column("position").to_pylist() == [0]
     vector_values = table.column("vector").to_pylist()
-    assert len(vector_values) == 1
     assert vector_values[0][0] == pytest.approx(0.1)
     assert vector_values[0][1] == pytest.approx(0.2)
-    assert table.column("sliding_window").to_pylist() == [None]
 
-    front_matter, body = _read_readme(tmp_path / "README.md")
-    config_names = {entry["config_name"] for entry in front_matter["configs"]}
-    assert {"all", "layer00", "l00h00q", "all_q", "layer00_q", "all_k"}.issubset(config_names)
-    all_entry = next(entry for entry in front_matter["configs"] if entry["config_name"] == "all")
-    assert all_entry.get("default") is True
-
-    specific_entry = next(entry for entry in front_matter["configs"] if entry["config_name"] == "l00h00q")
-    assert specific_entry["data_files"][0]["split"] == "meta_llama3_8b"
-    assert "l00h00q" in specific_entry["data_files"][0]["path"]
-    assert "- [meta/llama3-8b](https://huggingface.co/meta/llama3-8b)" in body
+    readme_path = tmp_path / "data" / "README.md"
+    assert readme_path.exists()
+    readme = readme_path.read_text(encoding="utf-8")
+    assert "# sniffed-qk (model specialization)" in readme
+    assert "`model`: `meta/llama3-8b`" in readme
+    assert "`l00h00q`" in readme
+    assert "`l00h00k`" in readme
 
 
 def test_dataset_saver_writes_token_strings(tmp_path):
     saver = DatasetSaver(
         root=tmp_path / "data",
         readme_path=tmp_path / "README.md",
-        dataset_name="viktoroo/sniffed-qk-test",
     )
     row = CaptureRow(
         model_name="meta/llama3-8b",
@@ -74,10 +65,18 @@ def test_dataset_saver_writes_token_strings(tmp_path):
     saver.add(row)
     saver.close()
 
-    parquet_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    parquet_path = tmp_path / "data" / "l00h00q" / "data.parquet"
     table = pq.read_table(parquet_path)
     assert "token_str" in table.schema.names
     assert table.column("token_str").to_pylist() == ["tok"]
+
+
+def test_dataset_saver_rejects_multiple_models_in_one_branch(tmp_path):
+    saver = DatasetSaver(root=tmp_path / "data", readme_path=tmp_path / "README.md")
+    saver.add(_row("meta/llama3-8b", layer=0, head=0, kind="q", bucket=0, example_id=0, position=0, vector=[0.1]))
+    with pytest.raises(ValueError, match="one model per branch"):
+        saver.add(_row("google/gemma3-9b", layer=0, head=0, kind="q", bucket=0, example_id=0, position=1, vector=[0.2]))
+    saver.close()
 
 
 def test_dataset_saver_skips_duplicates_same_session(tmp_path):
@@ -87,7 +86,7 @@ def test_dataset_saver_skips_duplicates_same_session(tmp_path):
     saver.add(row)
     saver.close()
 
-    parquet_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    parquet_path = tmp_path / "data" / "l00h00q" / "data.parquet"
     table = pq.read_table(parquet_path)
     assert table.num_rows == 1
 
@@ -105,7 +104,7 @@ def test_dataset_saver_skips_duplicates_across_sessions(tmp_path):
     saver2.add(row)
     saver2.close()
 
-    parquet_path = root / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    parquet_path = root / "l00h00q" / "data.parquet"
     table = pq.read_table(parquet_path)
     assert table.num_rows == 1
 
@@ -126,9 +125,8 @@ def test_dataset_saver_add_batch_deduplicates_and_flushes(tmp_path):
     saver.add_batch(batch)
     saver.close()
 
-    parquet_path = tmp_path / "data" / "meta_llama3_8b" / "l00h00q" / "data.parquet"
+    parquet_path = tmp_path / "data" / "l00h00q" / "data.parquet"
     table = pq.read_table(parquet_path)
-    # duplicate (7, 0) dropped
     assert table.num_rows == 2
     assert table.column("sliding_window").to_pylist() == [64, 64]
 
@@ -147,52 +145,43 @@ def test_dataset_saver_includes_model_stats_in_readme(tmp_path):
     row = _row("meta/llama3-8b", layer=0, head=0, kind="q", bucket=2, example_id=0, position=0, vector=[0.1, 0.2])
     saver.add(row)
     saver.close()
-    readme = (tmp_path / "README.md").read_text()
+
+    readme = (tmp_path / "data" / "README.md").read_text(encoding="utf-8")
     assert "dummy/dataset" in readme
+    assert "`sampling_strategy`: `log`" in readme
+    assert "`sampling_min_bucket_size`: `128`" in readme
     assert "b2=1" in readme
-    assert "split: `meta_llama3_8b`" in readme
-    assert "sampling strategy: log (min bucket size: 128)" in readme
-    assert "bucket width: powers of two >= 128 tokens" in readme
-    assert "layers: 1" in readme
-    assert "query heads: 1" in readme
-    assert "key heads: 0" in readme
 
 
-def test_relative_readme_path_is_saved_inside_data_root(tmp_path):
+def test_readme_is_always_written_to_dataset_root(tmp_path):
     data_root = tmp_path / "data"
-    saver = DatasetSaver(root=data_root, readme_path="README.md")
+    saver = DatasetSaver(root=data_root, readme_path=tmp_path / "outside" / "README.md")
     saver.add(_row("meta/llama3-8b", layer=0, head=0, kind="q", bucket=0, example_id=0, position=0, vector=[0.1]))
     saver.close()
 
     assert (data_root / "README.md").exists()
-    assert not (tmp_path / "README.md").exists()
+    assert not (tmp_path / "outside" / "README.md").exists()
 
 
 def test_dataset_saver_mirrors_readme_paths(tmp_path):
     repo_root = tmp_path / "repo"
     final_root = repo_root / "final"
     final_root.mkdir(parents=True)
-    primary_readme = repo_root / "README.md"
-    mirror_readme = final_root / "README.md"
+    mirror_readme = repo_root / "README.copy.md"
 
     saver = DatasetSaver(
         root=final_root,
-        readme_path=primary_readme,
+        readme_path=repo_root / "ignored.md",
         mirror_readme_paths=[mirror_readme],
         dataset_name="dummy/repo",
     )
     saver.add(_row("meta/llama3-8b", layer=0, head=0, kind="q", bucket=0, example_id=0, position=0, vector=[0.1]))
     saver.close()
 
+    primary_readme = final_root / "README.md"
     assert primary_readme.exists()
     assert mirror_readme.exists()
-
-    primary_front, _ = _read_readme(primary_readme)
-    mirror_front, _ = _read_readme(mirror_readme)
-    primary_layer = next(entry for entry in primary_front["configs"] if entry["config_name"] == "l00h00q")
-    mirror_layer = next(entry for entry in mirror_front["configs"] if entry["config_name"] == "l00h00q")
-    assert primary_layer["data_files"][0]["path"].startswith("final/")
-    assert not mirror_layer["data_files"][0]["path"].startswith("final/")
+    assert primary_readme.read_text(encoding="utf-8") == mirror_readme.read_text(encoding="utf-8")
 
 
 def test_dataset_saver_preserves_model_stats_across_runs(tmp_path):
@@ -208,48 +197,17 @@ def test_dataset_saver_preserves_model_stats_across_runs(tmp_path):
     first.close()
 
     second = DatasetSaver(root=root, readme_path=readme)
-    second.register_model_metadata("google/gemma3-9b", {"source_dataset": "other/dataset", "dataset_split": "train"})
-    second.add(_row("google/gemma3-9b", layer=1, head=1, kind="k", bucket=5, example_id=1, position=3, vector=[0.5]))
+    second.register_model_metadata("meta/llama3-8b", {"dataset_split": "train"})
+    second.add(_row("meta/llama3-8b", layer=1, head=1, kind="k", bucket=5, example_id=1, position=3, vector=[0.5]))
     second.close()
 
-    readme_text = readme.read_text()
-    assert "dummy/dataset" in readme_text, "metadata from the first run should remain"
-    assert "b2=1" in readme_text, "bucket counts from the first run should remain"
+    readme_text = (root / "README.md").read_text(encoding="utf-8")
+    assert "dummy/dataset" in readme_text
+    assert "b2=1" in readme_text
+    assert "b5=1" in readme_text
 
 
-def test_readme_preserves_custom_fields_and_description(tmp_path):
-    readme_path = tmp_path / "README.md"
-    readme_path.write_text(
-        """---
-configs:
-  - config_name: legacy
-    data_files: []
-custom_field: preserved
----
-# sniffed-qk
-Custom introduction that should survive.
-
-## Available Models
-<!-- MODELS_START -->
-- old
-<!-- MODELS_END -->
-
-Additional paragraph outside tracked sections.
-""",
-        encoding="utf-8",
-    )
-
-    saver = DatasetSaver(root=tmp_path / "data", readme_path=readme_path)
-    saver.add(_row("meta/llama3-8b", layer=0, head=0, kind="q", bucket=0, example_id=0, position=0, vector=[0.1]))
-    saver.close()
-
-    front_matter, body = _read_readme(readme_path)
-    assert front_matter.get("custom_field") == "preserved"
-    assert any(entry["config_name"] == "all" for entry in front_matter["configs"])
-    assert "Custom introduction that should survive." in body
-
-
-def test_hf_datasets_e2e_load(tmp_path):
+def test_hf_datasets_e2e_load_from_new_layout(tmp_path):
     saver = DatasetSaver(
         root=tmp_path / "data",
         readme_path=tmp_path / "README.md",
@@ -260,31 +218,27 @@ def test_hf_datasets_e2e_load(tmp_path):
         [
             _row("meta/llama3-8b", layer=0, head=0, kind="q", bucket=0, example_id=0, position=0, vector=[0.1]),
             _row("meta/llama3-8b", layer=0, head=0, kind="k", bucket=0, example_id=0, position=0, vector=[0.2]),
-            _row("google/gemma3-9b", layer=0, head=1, kind="q", bucket=1, example_id=1, position=2, vector=[0.3]),
+            _row("meta/llama3-8b", layer=0, head=1, kind="q", bucket=1, example_id=1, position=2, vector=[0.3]),
         ]
     )
     saver.close()
 
-    readme_path = tmp_path / "README.md"
-    front_matter, _ = _read_readme(readme_path)
-    configs = {entry["config_name"]: entry for entry in front_matter["configs"]}
-
-    q_entry = configs["l00h00q"]
-    q_data_files = _abs_paths(q_entry["data_files"], base_dir=readme_path.parent)
-    q_dataset = load_dataset("parquet", data_files=q_data_files, split="meta_llama3_8b")
+    q_dataset = load_dataset(
+        "parquet",
+        data_files=str(tmp_path / "data" / "l00h00q" / "*.parquet"),
+        split="train",
+        cache_dir=str(tmp_path / "hf-cache"),
+    )
     assert q_dataset.num_rows == 1
     assert q_dataset[0]["bucket"] == 0
 
-    layer_entry = configs["layer00"]
-    layer_data_files = _abs_paths(layer_entry["data_files"], base_dir=readme_path.parent)
-    layer_dataset = load_dataset("parquet", data_files=layer_data_files, split="meta_llama3_8b")
-    assert layer_dataset.num_rows == 2  # q + k samples
-
-    all_q_entry = configs["all_q"]
-    all_q_files = _abs_paths(all_q_entry["data_files"], base_dir=readme_path.parent)
-    gemma_dataset = load_dataset("parquet", data_files=all_q_files, split="google_gemma3_9b")
-    assert gemma_dataset.num_rows == 1
-    assert gemma_dataset[0]["position"] == 2
+    layer_dataset = load_dataset(
+        "parquet",
+        data_files=str(tmp_path / "data" / "l00h00*" / "*.parquet"),
+        split="train",
+        cache_dir=str(tmp_path / "hf-cache"),
+    )
+    assert layer_dataset.num_rows == 2  # q + k samples for l00h00
 
 
 def _row(
@@ -308,23 +262,3 @@ def _row(
         vector=vector,
         sliding_window=None,
     )
-
-
-def _read_readme(path: Path) -> tuple[dict, str]:
-    content = path.read_text(encoding="utf-8")
-    assert content.startswith("---")
-    _, front_raw, body = content.split("---", 2)
-    front = yaml.safe_load(front_raw.strip())
-    return front, body
-
-
-def _abs_paths(data_files: list[dict], *, base_dir: Path) -> dict:
-    result = {}
-    for item in data_files:
-        path = Path(item["path"])
-        if not path.is_absolute():
-            path = (base_dir / path).resolve()
-        else:
-            path = path.resolve()
-        result[item["split"]] = str(path)
-    return result

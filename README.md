@@ -1,6 +1,6 @@
 # qk-sniffer
 
-`qk-sniffer` instruments Hugging Face transformer models so each attention layer can stream sampled key/query vectors into Parquet shards that mirror Hugging Face dataset repos. It ships with Gemma 3/Llama/Qwen 3 hooks, a deterministic sampler, and a CLI (`sniff-qk`) that can pull/push full datasets from the Hub.
+`qk-sniffer` instruments Hugging Face transformer models so each attention layer can stream sampled key/query vectors into Parquet shards that mirror Hugging Face dataset repos. It ships with Gemma 3/Llama/Mllama/Mistral 3+Ministral/Qwen 3 hooks, a deterministic sampler, and a CLI (`sniff-qk`) that can pull/push full datasets from the Hub.
 
 ## Requirements & Installation
 - Python 3.9+, recent PyTorch build matching your hardware.
@@ -13,7 +13,7 @@
 - Put secrets (e.g., `HF_TOKEN`) in a `.env`; `python-dotenv` loads them automatically.
 
 ## Quick Start
-1. **Instrument the model (if needed).** Copy the relevant `transformers` module into `models/<name>/modeling_<name>.py`, import `get_active_sniffer`/`compute_positions`, and call `sniffer.capture(...)` inside the attention block. Gemma 3, Llama, and Qwen 3 are already wired up.
+1. **Instrument the model (if needed).** Copy the relevant `transformers` module into `models/<name>/modeling_<name>.py`, import `get_active_sniffer`/`compute_positions`, and call `sniffer.capture(...)` inside the attention block. Gemma 3, Llama, Mllama, Mistral 3+Ministral, and Qwen 3 are already wired up.
 2. **Create a config** (adapt the sample below):
    ```yaml
    dataset:
@@ -29,15 +29,21 @@
    inference:
      batch_size: 2
      autocast_dtype: float16
-  capture:
-    capture_queries: true
-    capture_keys: true
-    min_bucket_size: 128
-    sampler:
-      type: log_uniform       # log_uniform | uniform | all
-      base_rate: 1.0
-    capture_pre_rope: false
-    capture_token_strings: false
+     distributed: false        # true when launching via torchrun
+     backend: auto             # auto | nccl | gloo
+   capture:
+     capture_queries: true
+     capture_keys: true
+     full_attention_only: false # true => skip sliding/window-attention layers
+     min_bucket_size: 128
+     head_sampling:
+       count: 300             # sample query heads across all selected layers
+       seed: 0
+     sampler:
+       type: log_uniform       # log_uniform | uniform | all
+       base_rate: 1.0
+     capture_pre_rope: false
+     capture_token_strings: false
    output:
      data_root: data/sniffed-qk
      readme_path: README.md
@@ -52,10 +58,15 @@
    The CLI patches local modeling files into `transformers`, downloads the latest dataset snapshot (if `hf_repo_id` is set), runs inference, writes captures directly into that synced copy, then uploads the result.
 
 ## Key Configuration Notes
-- `dataset.*` maps directly to `datasets.load_dataset`. Set `max_samples` for dry runs. Use `streaming: true` to stream without downloading the full split; when streaming, `max_samples` stops after the first *N* examples.
-- `model.*`/`tokenizer.*` feed `AutoModelForCausalLM` and `AutoTokenizer`. `device_map=auto` works well for multi-GPU.
+- `dataset.*` maps directly to `datasets.load_dataset`. Set `max_samples` for dry runs. Use `streaming: true` to stream without downloading the full split; when streaming, `max_samples` stops after the first *N* examples. In distributed runs, `max_samples` is treated as a global cap across all ranks (the dataset is capped first, then sharded).
+- `model.*`/`tokenizer.*` feed `AutoModelForCausalLM` and `AutoTokenizer`. For single-process runs, `device_map=auto` works well for model sharding. In distributed (`torchrun`) mode, each rank loads the model on its local GPU.
+- `inference.*`
+  - `distributed=true` enables rank-aware execution (expects `torchrun` environment variables).
+  - `backend=auto` picks `nccl` on CUDA and `gloo` otherwise.
 - `capture.*`
   - `layers`, `heads` accept Python-style integer lists; omit to capture every head.
+  - `full_attention_only=true` ignores local/sliding-window attention captures and keeps only full-attention captures.
+  - `head_sampling` picks a deterministic random set of query heads (`count`, optional `seed`) across all selected layers. Key heads are captured automatically when any sampled query head maps to them (for grouped-query attention).
   - `sampler.type=all` captures every token (no subsampling) while still bucketing by `min_bucket_size` for reporting. To capture the first *N* tokens, set `tokenizer.max_length` to *N*.
   - `min_bucket_size` drives bucketing (and sampling for `log_uniform`/`uniform`): `log_uniform` rounds it up to the next power of two and uses it as the minimum `2^i` bucket width (bucket IDs remain the exponent `i`, so `b{i}` → `[2^i, 2^{i+1})`). `uniform` and `all` store `floor(position / min_bucket_size)`.
   - `capture_pre_rope` captures Q/K before rotary position embedding is applied (default captures post-RoPE).
@@ -64,6 +75,7 @@
 - `output.*`
   - `data_root` is both your working directory and (optionally) the local clone of `hf_repo_id`. Each run pulls the repo into `data_root`, records captures there immediately, and pushes it back once inference finishes.
   - `readme_path` may be relative (inside `data_root`) or absolute. It is rewritten in place so the Hub copy stays in sync with the local metadata before uploading.
+  - Distributed mode writes rank-local shards to a temporary side directory, then rank 0 merges into `data_root` before pushing.
 
 ## Capture Output & Dataset Layout
 - Each `(model split, layer, head, vector_kind)` writes to `data/<sanitized_model>/<lXXhYY{q|k}>/data.parquet`. Splits sanitize `[\W]` → `_` (e.g., `meta/llama3-8b` → `meta_llama3_8b`).

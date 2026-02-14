@@ -3,3 +3,5 @@
 venv/
 .hf_cache
 data/
+tmp_data/
+tmp*
