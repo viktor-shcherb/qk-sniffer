@@ -88,6 +88,7 @@ class ModelSettings:
     dtype: str = "float16"
     device_map: Optional[Any] = "auto"
     trust_remote_code: bool = False
+    attn_implementation: Optional[str] = None
     config_overrides: Optional[Dict[str, Any]] = None
 
 
@@ -314,6 +315,8 @@ def _load_mistral3_for_conditional_generation_model(
     kwargs: Dict[str, Any] = {}
     if model_config is not None:
         kwargs["config"] = model_config
+    if settings.attn_implementation:
+        kwargs["attn_implementation"] = settings.attn_implementation
     return Mistral3ForConditionalGeneration.from_pretrained(
         settings.name,
         revision=settings.revision,
@@ -341,6 +344,8 @@ def _load_auto_model_for_image_text_to_text(
     kwargs: Dict[str, Any] = {}
     if model_config is not None:
         kwargs["config"] = model_config
+    if settings.attn_implementation:
+        kwargs["attn_implementation"] = settings.attn_implementation
     return AutoModelForImageTextToText.from_pretrained(
         settings.name,
         revision=settings.revision,
@@ -393,6 +398,8 @@ def _load_model_from_pretrained(
     kwargs: Dict[str, Any] = {}
     if model_config is not None:
         kwargs["config"] = model_config
+    if settings.attn_implementation:
+        kwargs["attn_implementation"] = settings.attn_implementation
     try:
         return AutoModelForCausalLM.from_pretrained(
             settings.name,
@@ -412,6 +419,20 @@ def _load_model_from_pretrained(
             torch_dtype=torch_dtype,
             device_map=device_map,
         )
+
+
+def _resolve_attn_implementation(requested: Optional[str]) -> Optional[str]:
+    """Pick the best attention backend. Returns None only on non-CUDA."""
+    if requested is not None:
+        return requested
+    if not torch.cuda.is_available():
+        return None  # let HF default (sdpa/eager)
+    try:
+        import flash_attn  # noqa: F401
+
+        return "flash_attention_2"
+    except ImportError:
+        return "sdpa"
 
 
 def resolve_dtype(name: str) -> torch.dtype:
@@ -1200,7 +1221,13 @@ def run_inference(config: SniffConfig) -> None:
             device_map = None
         device_map = _normalize_device_map_for_runtime(device_map, distributed=distributed)
 
-        _debug_log(debug_logging, f"loading model: dtype={torch_dtype}, device_map={device_map!r}")
+        resolved_attn = _resolve_attn_implementation(config.model.attn_implementation)
+        if resolved_attn and resolved_attn != config.model.attn_implementation:
+            config.model.attn_implementation = resolved_attn
+        _debug_log(
+            debug_logging,
+            f"loading model: dtype={torch_dtype}, device_map={device_map!r}, attn={config.model.attn_implementation!r}",
+        )
         model_load_start = perf_counter()
         model = _load_model_from_pretrained(
             settings=config.model,
