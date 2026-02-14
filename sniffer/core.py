@@ -9,6 +9,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union, Literal
 
+import numpy as np
 import torch
 
 from saver.dataset import CaptureBatch, DatasetSaver
@@ -46,10 +47,10 @@ class SnifferConfig:
 @dataclass(slots=True)
 class _PendingCapture:
     layer_idx: int
-    head_idx: int
     vector_kind: Literal["q", "k"]
     sliding_window: Optional[int]
     vectors: List[torch.Tensor] = field(default_factory=list)
+    head_indices: List[torch.Tensor] = field(default_factory=list)
     example_ids: List[torch.Tensor] = field(default_factory=list)
     positions: List[torch.Tensor] = field(default_factory=list)
     buckets: List[torch.Tensor] = field(default_factory=list)
@@ -228,134 +229,138 @@ class Sniffer:
         token_strings: Optional[Sequence[Sequence[str]]],
     ) -> None:
         batch_size, num_heads, _, _ = states.shape
-        for head_idx in self._head_indices(
+        head_indices_list = self._head_indices(
             layer_idx=layer_idx,
             total_heads=num_heads,
             vector_kind=vector_kind,
-        ):
-            head_states = states[:, head_idx]
-            vectors_parts: List[torch.Tensor] = []
-            examples_parts: List[torch.Tensor] = []
-            positions_parts: List[torch.Tensor] = []
-            buckets_parts: List[torch.Tensor] = []
-            token_parts: Optional[List[str]] = [] if token_strings is not None else None
-            for batch_idx in range(batch_size):
-                valid_length = valid_lengths[batch_idx]
-                if valid_length <= 0:
-                    continue
-                example_id = int(example_ids[batch_idx])
-                position_slice = positions[batch_idx, :valid_length]
-                bucket_slice = buckets[batch_idx, :valid_length]
-                mask = self.sampler.sample_positions(
-                    layer_idx=layer_idx,
-                    head_idx=head_idx,
-                    vector_kind=vector_kind,
-                    example_id=example_id,
-                    positions=position_slice,
-                    buckets=bucket_slice,
-                )
-                if mask.ndim != 1:
-                    raise ValueError("Sampler must return a 1D mask.")
-                if mask.shape[0] != valid_length:
-                    raise ValueError(
-                        f"Sampler returned mask of shape {mask.shape} for sequence length {valid_length}."
-                    )
-                if mask.dtype != torch.bool or mask.device != states.device:
-                    mask = mask.to(device=states.device, dtype=torch.bool)
-                vectors = head_states[batch_idx, :valid_length][mask]
-                positions_kept = position_slice[mask]
-                buckets_kept = bucket_slice[mask]
-                examples_kept = torch.full(
-                    (vectors.shape[0],),
-                    fill_value=example_id,
-                    device=states.device,
-                    dtype=torch.int64,
-                )
-                tokens_kept: Optional[List[str]] = None
-                if token_strings is not None:
-                    token_slice = list(token_strings[batch_idx])[:valid_length]
-                    mask_list = mask.detach().to(device="cpu").tolist()
-                    tokens_kept = [tok for tok, keep in zip(token_slice, mask_list) if keep]
-                (
-                    vectors,
-                    examples_kept,
-                    positions_kept,
-                    buckets_kept,
-                    tokens_kept,
-                ) = self._maybe_downsample(
-                    layer_idx=layer_idx,
-                    head_idx=head_idx,
-                    vector_kind=vector_kind,
-                    example_id=example_id,
-                    vectors=vectors,
-                    example_ids=examples_kept,
-                    positions=positions_kept,
-                    buckets=buckets_kept,
-                    token_strings=tokens_kept,
-                )
-                row_count = int(vectors.shape[0])
-                if row_count == 0:
-                    continue
-                vectors_parts.append(vectors)
-                examples_parts.append(examples_kept)
-                positions_parts.append(positions_kept)
-                buckets_parts.append(buckets_kept)
-                if token_parts is not None:
-                    token_parts.extend(tokens_kept or [])
+        )
+        if not head_indices_list:
+            return
 
-            if not vectors_parts:
+        device = states.device
+        n_heads = len(head_indices_list)
+        head_idx_tensor = torch.tensor(list(head_indices_list), device=device, dtype=torch.int64)
+
+        # Extract states for all active heads at once: (batch, n_active, seq, dim)
+        active_states = states[:, head_idx_tensor]
+
+        all_vectors: List[torch.Tensor] = []
+        all_head_ids: List[torch.Tensor] = []
+        all_examples: List[torch.Tensor] = []
+        all_positions: List[torch.Tensor] = []
+        all_buckets: List[torch.Tensor] = []
+        all_tokens: Optional[List[str]] = [] if token_strings is not None else None
+
+        for batch_idx in range(batch_size):
+            valid_length = valid_lengths[batch_idx]
+            if valid_length <= 0:
                 continue
-            vectors_joined = torch.cat(vectors_parts, dim=0) if len(vectors_parts) > 1 else vectors_parts[0]
-            examples_joined = torch.cat(examples_parts, dim=0) if len(examples_parts) > 1 else examples_parts[0]
-            positions_joined = torch.cat(positions_parts, dim=0) if len(positions_parts) > 1 else positions_parts[0]
-            buckets_joined = torch.cat(buckets_parts, dim=0) if len(buckets_parts) > 1 else buckets_parts[0]
-            self._append_pending_capture(
+            example_id = int(example_ids[batch_idx])
+            pos_slice = positions[batch_idx, :valid_length]
+            bkt_slice = buckets[batch_idx, :valid_length]
+
+            # Generate ONE shared mask for all heads: (valid_length,)
+            mask = self.sampler.sample_positions_batch(
                 layer_idx=layer_idx,
-                head_idx=head_idx,
+                head_indices=head_indices_list,
                 vector_kind=vector_kind,
-                vectors=vectors_joined,
-                example_ids=examples_joined,
-                positions=positions_joined,
-                buckets=buckets_joined,
-                sliding_window=sliding_window,
-                token_strings=token_parts,
+                example_id=example_id,
+                positions=pos_slice,
+                buckets=bkt_slice,
+            )
+            if mask.ndim != 1:
+                raise ValueError("Sampler batch method must return a 1D mask.")
+            if mask.shape[0] != valid_length:
+                raise ValueError(
+                    f"Sampler returned mask of shape {mask.shape} for sequence length {valid_length}."
+                )
+            if mask.dtype != torch.bool or mask.device != device:
+                mask = mask.to(device=device, dtype=torch.bool)
+
+            # Find selected position indices (shared across all heads)
+            selected_pos = mask.nonzero(as_tuple=False).squeeze(1)  # (K,)
+            if selected_pos.ndim == 0:
+                selected_pos = selected_pos.unsqueeze(0)
+            K = selected_pos.shape[0]
+            if K == 0:
+                continue
+
+            # Per-batch-item downsample (shared across heads)
+            if self._max_rows_per_batch is not None and K > self._max_rows_per_batch:
+                limit = self._max_rows_per_batch
+                gen = torch.Generator(device=device)
+                gen.manual_seed(self._subsample_seed(
+                    layer_idx=layer_idx, head_idx=int(head_idx_tensor[0].item()),
+                    vector_kind=vector_kind, example_id=example_id,
+                ))
+                perm = torch.randperm(K, device=device, generator=gen)
+                selected_pos = selected_pos[perm[:limit]]
+                K = limit
+
+            # Gather vectors for ALL heads at selected positions
+            # active_states[batch_idx]: (n_heads, seq, dim)
+            # active_states[batch_idx, :, selected_pos]: (n_heads, K, dim)
+            vectors = active_states[batch_idx, :, selected_pos]  # (n_heads, K, dim)
+            vectors_flat = vectors.reshape(n_heads * K, -1)
+
+            # Build head indices: [h0, h0, ..., h1, h1, ...]
+            head_ids = head_idx_tensor.unsqueeze(1).expand(n_heads, K).reshape(-1)
+
+            # Replicate positions/buckets/example_ids for each head
+            positions_flat = pos_slice[selected_pos].unsqueeze(0).expand(n_heads, K).reshape(-1)
+            buckets_flat = bkt_slice[selected_pos].unsqueeze(0).expand(n_heads, K).reshape(-1)
+            examples_flat = torch.full(
+                (n_heads * K,), fill_value=example_id, device=device, dtype=torch.int64,
             )
 
-    def _append_pending_capture(
-        self,
-        *,
-        layer_idx: int,
-        head_idx: int,
-        vector_kind: str,
-        vectors: torch.Tensor,
-        example_ids: torch.Tensor,
-        positions: torch.Tensor,
-        buckets: torch.Tensor,
-        sliding_window: Optional[int],
-        token_strings: Optional[Sequence[str]],
-    ) -> None:
-        key = f"l{layer_idx:02d}h{head_idx:02d}{vector_kind}"
+            all_vectors.append(vectors_flat)
+            all_head_ids.append(head_ids)
+            all_examples.append(examples_flat)
+            all_positions.append(positions_flat)
+            all_buckets.append(buckets_flat)
+
+            if token_strings is not None and all_tokens is not None:
+                token_slice = list(token_strings[batch_idx])[:valid_length]
+                sel_pos_cpu = selected_pos.cpu().tolist()
+                tokens_at_pos = [token_slice[p] for p in sel_pos_cpu]
+                # Replicate for each head (same tokens at same positions)
+                for _ in range(n_heads):
+                    all_tokens.extend(tokens_at_pos)
+
+        if not all_vectors:
+            return
+
+        vectors_joined = torch.cat(all_vectors) if len(all_vectors) > 1 else all_vectors[0]
+        head_ids_joined = torch.cat(all_head_ids) if len(all_head_ids) > 1 else all_head_ids[0]
+        examples_joined = torch.cat(all_examples) if len(all_examples) > 1 else all_examples[0]
+        positions_joined = torch.cat(all_positions) if len(all_positions) > 1 else all_positions[0]
+        buckets_joined = torch.cat(all_buckets) if len(all_buckets) > 1 else all_buckets[0]
+
+        # Store in pending capture keyed by (layer, kind) instead of (layer, head, kind)
+        key = f"l{layer_idx:02d}{vector_kind}"
         pending = self._pending_captures.get(key)
         has_tokens = token_strings is not None
         if pending is None:
             pending = _PendingCapture(
                 layer_idx=layer_idx,
-                head_idx=head_idx,
                 vector_kind=vector_kind,  # type: ignore[arg-type]
                 sliding_window=sliding_window,
                 token_strings=[] if has_tokens else None,
             )
             self._pending_captures[key] = pending
         elif pending.sliding_window != sliding_window:
-            raise ValueError(f"Inconsistent sliding_window for {key}: {pending.sliding_window} vs {sliding_window}.")
+            raise ValueError(
+                f"Inconsistent sliding_window for {key}: {pending.sliding_window} vs {sliding_window}."
+            )
         if (pending.token_strings is None) != (not has_tokens):
             raise ValueError(f"Inconsistent token string capture for {key} within the same batch.")
-        pending.vectors.append(vectors)
-        pending.example_ids.append(example_ids)
-        pending.positions.append(positions)
-        pending.buckets.append(buckets)
+        pending.vectors.append(vectors_joined)
+        pending.head_indices.append(head_ids_joined)
+        pending.example_ids.append(examples_joined)
+        pending.positions.append(positions_joined)
+        pending.buckets.append(buckets_joined)
         if pending.token_strings is not None:
-            pending.token_strings.extend(list(token_strings or ()))
+            pending.token_strings.extend(all_tokens or [])
 
     def flush_batch(self) -> None:
         if not self._pending_captures:
@@ -375,28 +380,50 @@ class Sniffer:
             if not pending.vectors:
                 continue
             vectors = torch.cat(pending.vectors, dim=0) if len(pending.vectors) > 1 else pending.vectors[0]
+            head_indices = (
+                torch.cat(pending.head_indices, dim=0) if len(pending.head_indices) > 1 else pending.head_indices[0]
+            )
             example_ids = (
                 torch.cat(pending.example_ids, dim=0) if len(pending.example_ids) > 1 else pending.example_ids[0]
             )
             positions = torch.cat(pending.positions, dim=0) if len(pending.positions) > 1 else pending.positions[0]
             buckets = torch.cat(pending.buckets, dim=0) if len(pending.buckets) > 1 else pending.buckets[0]
-            batch_payload = self._build_capture_batch(
-                layer_idx=pending.layer_idx,
-                head_idx=pending.head_idx,
-                vector_kind=pending.vector_kind,
-                vectors=vectors,
-                example_ids=example_ids,
-                positions=positions,
-                buckets=buckets,
-                sliding_window=pending.sliding_window,
-                token_strings=pending.token_strings,
-            )
-            if batch_payload is None:
-                continue
-            submit_wait_s = self._writer.submit(batch_payload)
-            self._captured_payloads += 1
-            self._captured_rows += int(batch_payload.vectors.shape[0])
-            self._submit_wait_s += submit_wait_s
+
+            # Batch GPU→CPU transfer (few large copies instead of many small ones)
+            vectors_np = vectors.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy()
+            head_indices_np = head_indices.detach().to(device="cpu", dtype=torch.int64).contiguous().numpy()
+            example_ids_np = example_ids.detach().to(device="cpu", dtype=torch.int64).contiguous().numpy()
+            positions_np = positions.detach().to(device="cpu", dtype=torch.int64).contiguous().numpy()
+            buckets_np = buckets.detach().to(device="cpu", dtype=torch.int64).contiguous().numpy()
+
+            # Split by head on CPU
+            unique_heads = np.unique(head_indices_np)
+            for head_idx in unique_heads:
+                mask = head_indices_np == int(head_idx)
+                h_vectors = vectors_np[mask]
+                row_count = h_vectors.shape[0]
+                if row_count == 0:
+                    continue
+                h_token_strings: Optional[List[str]] = None
+                if pending.token_strings is not None:
+                    indices = np.where(mask)[0]
+                    h_token_strings = [pending.token_strings[i] for i in indices]
+                batch_payload = CaptureBatch(
+                    model_name=self.config.model_name,
+                    layer_idx=pending.layer_idx,
+                    head_idx=int(head_idx),
+                    vector_kind=pending.vector_kind,
+                    buckets=buckets_np[mask],
+                    example_ids=example_ids_np[mask],
+                    positions=positions_np[mask],
+                    vectors=h_vectors,
+                    sliding_window=pending.sliding_window,
+                    token_strings=h_token_strings,
+                )
+                submit_wait_s = self._writer.submit(batch_payload)
+                self._captured_payloads += 1
+                self._captured_rows += row_count
+                self._submit_wait_s += submit_wait_s
         self._pending_captures.clear()
         self._flush_invocations += 1
         self._flush_time_s += perf_counter() - flush_start
@@ -440,65 +467,6 @@ class Sniffer:
             allowed &= sampled_heads
         return sorted(allowed)
 
-
-    def _maybe_downsample(
-        self,
-        *,
-        layer_idx: int,
-        head_idx: int,
-        vector_kind: str,
-        example_id: int,
-        vectors: torch.Tensor,
-        example_ids: torch.Tensor,
-        positions: torch.Tensor,
-        buckets: torch.Tensor,
-        token_strings: Optional[Sequence[str]],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[List[str]]]:
-        limit = self._max_rows_per_batch
-        row_count = vectors.shape[0]
-        if limit is None or row_count <= limit:
-            return vectors, example_ids, positions, buckets, list(token_strings) if token_strings is not None else None
-        generator = torch.Generator(device=vectors.device)
-        generator.manual_seed(
-            self._subsample_seed(layer_idx=layer_idx, head_idx=head_idx, vector_kind=vector_kind, example_id=example_id)
-        )
-        perm = torch.randperm(row_count, device=vectors.device, generator=generator)
-        keep = perm[:limit]
-        kept_tokens: Optional[List[str]] = None
-        if token_strings is not None:
-            kept_tokens = [token_strings[idx] for idx in keep.to("cpu").tolist()]
-        return vectors[keep], example_ids[keep], positions[keep], buckets[keep], kept_tokens
-
-    def _build_capture_batch(
-        self,
-        *,
-        layer_idx: int,
-        head_idx: int,
-        vector_kind: str,
-        vectors: torch.Tensor,
-        example_ids: torch.Tensor,
-        positions: torch.Tensor,
-        buckets: torch.Tensor,
-        sliding_window: Optional[int],
-        token_strings: Optional[Sequence[str]],
-    ) -> Optional[CaptureBatch]:
-        row_count = vectors.shape[0]
-        if row_count == 0:
-            return None
-        if token_strings is not None and len(token_strings) != row_count:
-            raise ValueError("Token strings length must match number of captured rows.")
-        return CaptureBatch(
-            model_name=self.config.model_name,
-            layer_idx=layer_idx,
-            head_idx=head_idx,
-            vector_kind=vector_kind,  # type: ignore[arg-type]
-            buckets=buckets.detach().to(device="cpu", dtype=torch.int64).contiguous().numpy(),
-            example_ids=example_ids.detach().to(device="cpu", dtype=torch.int64).contiguous().numpy(),
-            positions=positions.detach().to(device="cpu", dtype=torch.int64).contiguous().numpy(),
-            vectors=vectors.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy(),
-            sliding_window=sliding_window,
-            token_strings=list(token_strings) if token_strings is not None else None,
-        )
 
     def _subsample_seed(self, *, layer_idx: int, head_idx: int, vector_kind: str, example_id: int) -> int:
         seed = (

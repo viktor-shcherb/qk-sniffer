@@ -1375,7 +1375,11 @@ def run_inference(config: SniffConfig) -> None:
                             else nullcontext()
                         )
                         with context:
-                            model(**inputs)
+                            backbone = getattr(model, "model", None)
+                            if isinstance(backbone, torch.nn.Module):
+                                backbone(**inputs)
+                            else:
+                                model(**inputs)
                     if callable(flush_batch):
                         flush_batch()
                     if debug_this_batch:
