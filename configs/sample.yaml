@@ -21,7 +21,7 @@ tokenizer:
   trust_remote_code: false
 
 inference:
-  batch_size: 8
+  batch_size: 1
   autocast_dtype: float16
   debug_logging: true
 
@@ -36,10 +36,10 @@ capture:
   full_attention_only: true
   capture_pre_rope: false
   capture_token_strings: false
-  min_bucket_size: 32
+  min_bucket_size: 8192
   sampler:
     type: uniform
-    base_rate: 10.0
+    base_rate: 1.0
 
 output:
   data_root: data/attention-plasticity

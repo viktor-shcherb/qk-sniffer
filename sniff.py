@@ -1101,7 +1101,12 @@ def run_inference(config: SniffConfig) -> None:
                     _debug_log(True, f"batch {batch_idx}: valid token lengths min/max={valid_min}/{valid_max}")
                     _debug_log(True, f"batch {batch_idx}: moving tensors to device {primary_device}")
                 move_start = perf_counter()
-                inputs = {k: v.to(primary_device) for k, v in encodings.items()}
+                # Drop attention_mask to prevent O(seq_len²) 4D causal mask
+                # expansion inside the model.  With right-side padding the
+                # built-in causal mask is sufficient: real tokens precede
+                # padding tokens and never attend to them.  The sniffer
+                # already knows valid lengths via set_active_sequence_lengths.
+                inputs = {k: v.to(primary_device) for k, v in encodings.items() if k != "attention_mask"}
                 if debug_this_batch:
                     _debug_log(
                         True,

@@ -24,7 +24,7 @@ tokenizer:
   padding: longest
 
 inference:
-  batch_size: 4
+  batch_size: 1
   autocast_dtype: bfloat16
 
 capture:
@@ -37,10 +37,10 @@ capture:
     seed: 0
   full_attention_only: true
   capture_pre_rope: false
-  min_bucket_size: 2048
+  min_bucket_size: 8192
   sampler:
     type: uniform
-    base_rate: 5.0
+    base_rate: 1.0
 
 output:
   data_root: data/attention-plasticity
