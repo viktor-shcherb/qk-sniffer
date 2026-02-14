@@ -21,7 +21,7 @@ tokenizer:
   trust_remote_code: false
 
 inference:
-  batch_size: 1
+  batch_size: 8
   autocast_dtype: float16
   debug_logging: true
 
@@ -36,7 +36,7 @@ capture:
   full_attention_only: true
   capture_pre_rope: false
   capture_token_strings: false
-  min_bucket_size: 8192
+  min_bucket_size: 32
   sampler:
     type: uniform
     base_rate: 1.0

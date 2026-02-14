@@ -19,7 +19,7 @@ tokenizer:
   padding: longest
 
 inference:
-  batch_size: 1
+  batch_size: 2
   autocast_dtype: bfloat16
 
 capture:
