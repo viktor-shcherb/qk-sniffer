@@ -139,22 +139,23 @@ class Sniffer:
         capture_start = perf_counter()
         with torch.no_grad():
             batch_size, _, seq_len, _ = query_states.shape
-            device = query_states.device
-            positions = positions.to(device=device, dtype=torch.int64)
+            # Positions and buckets on CPU: sampling + nonzero happen on CPU
+            # (instant) instead of GPU (forces CUDA sync per call).
+            positions_cpu = positions.to(device="cpu", dtype=torch.int64)
             example_ids = self._resolve_example_ids(batch_size)
             token_strings = self._prepare_token_strings(batch_size, seq_len)
             if self._bucket_kind == "log":
-                positions_fp = positions.to(torch.float32)
+                positions_fp = positions_cpu.to(torch.float32)
                 raw_buckets = torch.floor(torch.log2(positions_fp + 1.0))
                 bucket_floor = float(self._min_bucket_power)
                 clamped = torch.clamp(raw_buckets, min=bucket_floor)
-                buckets = clamped.to(torch.int64)
+                buckets_cpu = clamped.to(torch.int64)
             elif self._bucket_kind in {"uniform", "all"}:
-                positions_fp = positions.to(torch.float32)
+                positions_fp = positions_cpu.to(torch.float32)
                 bucket_size = float(self._uniform_bucket_size)
-                buckets = torch.floor(positions_fp / bucket_size).to(torch.int64)
+                buckets_cpu = torch.floor(positions_fp / bucket_size).to(torch.int64)
             else:
-                buckets = torch.zeros_like(positions, dtype=torch.int64)
+                buckets_cpu = torch.zeros_like(positions_cpu, dtype=torch.int64)
             valid_lengths = self._resolve_sequence_lengths(batch_size, seq_len)
 
             if self.config.capture_queries:
@@ -163,8 +164,8 @@ class Sniffer:
                     vector_kind="q",
                     states=query_states.detach(),
                     example_ids=example_ids,
-                    positions=positions,
-                    buckets=buckets,
+                    positions=positions_cpu,
+                    buckets=buckets_cpu,
                     valid_lengths=valid_lengths,
                     sliding_window=sliding_window,
                     token_strings=token_strings,
@@ -175,8 +176,8 @@ class Sniffer:
                     vector_kind="k",
                     states=key_states.detach(),
                     example_ids=example_ids,
-                    positions=positions,
-                    buckets=buckets,
+                    positions=positions_cpu,
+                    buckets=buckets_cpu,
                     valid_lengths=valid_lengths,
                     sliding_window=sliding_window,
                     token_strings=token_strings,
@@ -228,6 +229,12 @@ class Sniffer:
         sliding_window: Optional[int],
         token_strings: Optional[Sequence[Sequence[str]]],
     ) -> None:
+        """Capture vectors for selected positions across all active heads.
+
+        Positions/buckets are CPU tensors; sampling and nonzero happen on CPU
+        (instant) to avoid CUDA synchronisation.  Only the small index tensor
+        is sent to the GPU for async vector gathering.
+        """
         batch_size, num_heads, _, _ = states.shape
         head_indices_list = self._head_indices(
             layer_idx=layer_idx,
@@ -237,10 +244,16 @@ class Sniffer:
         if not head_indices_list:
             return
 
-        device = states.device
+        device = states.device  # GPU (or CPU in tests)
         n_heads = len(head_indices_list)
         all_heads = n_heads == num_heads
-        head_idx_tensor = torch.tensor(list(head_indices_list), device=device, dtype=torch.int64)
+        # CPU tensor for metadata; GPU copy only needed for non-trivial head selection
+        head_idx_cpu = torch.tensor(list(head_indices_list), dtype=torch.int64)
+        head_idx_gpu = (
+            head_idx_cpu.to(device=device, non_blocking=True)
+            if not all_heads and device.type != "cpu"
+            else head_idx_cpu
+        )
 
         all_vectors: List[torch.Tensor] = []
         all_head_ids: List[torch.Tensor] = []
@@ -254,10 +267,11 @@ class Sniffer:
             if valid_length <= 0:
                 continue
             example_id = int(example_ids[batch_idx])
+            # positions and buckets are CPU tensors
             pos_slice = positions[batch_idx, :valid_length]
             bkt_slice = buckets[batch_idx, :valid_length]
 
-            # Generate ONE shared mask for all heads: (valid_length,)
+            # Sample on CPU — mask is CPU, nonzero is instant (no CUDA sync)
             mask = self.sampler.sample_positions_batch(
                 layer_idx=layer_idx,
                 head_indices=head_indices_list,
@@ -272,10 +286,10 @@ class Sniffer:
                 raise ValueError(
                     f"Sampler returned mask of shape {mask.shape} for sequence length {valid_length}."
                 )
-            if mask.dtype != torch.bool or mask.device != device:
-                mask = mask.to(device=device, dtype=torch.bool)
+            if mask.dtype != torch.bool:
+                mask = mask.to(dtype=torch.bool)
 
-            # Find selected position indices (shared across all heads)
+            # CPU nonzero — instant, no GPU sync
             selected_pos = mask.nonzero(as_tuple=False).squeeze(1)  # (K,)
             if selected_pos.ndim == 0:
                 selected_pos = selected_pos.unsqueeze(0)
@@ -283,33 +297,33 @@ class Sniffer:
             if K == 0:
                 continue
 
-            # Per-batch-item downsample (shared across heads)
+            # Per-batch-item downsample on CPU
             if self._max_rows_per_batch is not None and K > self._max_rows_per_batch:
                 limit = self._max_rows_per_batch
-                gen = torch.Generator(device=device)
+                gen = torch.Generator()  # CPU generator
                 gen.manual_seed(self._subsample_seed(
-                    layer_idx=layer_idx, head_idx=int(head_idx_tensor[0].item()),
+                    layer_idx=layer_idx, head_idx=int(head_idx_cpu[0].item()),
                     vector_kind=vector_kind, example_id=example_id,
                 ))
-                perm = torch.randperm(K, device=device, generator=gen)
+                perm = torch.randperm(K, generator=gen)
                 selected_pos = selected_pos[perm[:limit]]
                 K = limit
 
-            # Gather vectors: first select K positions (small), then select heads.
-            # states[batch_idx, :, selected_pos] is (total_heads, K, dim) — e.g. 4MB
-            # vs pre-gathering all heads at all positions — e.g. 512MB.
-            at_pos = states[batch_idx, :, selected_pos]  # (total_heads, K, dim)
-            vectors = at_pos if all_heads else at_pos[head_idx_tensor]  # (n_heads, K, dim)
+            # Send only the small index tensor to GPU (async, non-blocking)
+            selected_pos_gpu = selected_pos.to(device=device, non_blocking=True)
+
+            # Gather vectors: position-first (small) then head-select
+            at_pos = states[batch_idx, :, selected_pos_gpu]  # (total_heads, K, dim)
+            vectors = at_pos if all_heads else at_pos[head_idx_gpu]  # (n_heads, K, dim)
             vectors_flat = vectors.reshape(n_heads * K, -1)
 
-            # Build head indices: [h0, h0, ..., h1, h1, ...]
-            head_ids = head_idx_tensor.unsqueeze(1).expand(n_heads, K).reshape(-1)
-
-            # Replicate positions/buckets/example_ids for each head
-            positions_flat = pos_slice[selected_pos].unsqueeze(0).expand(n_heads, K).reshape(-1)
+            # Metadata stays on CPU
+            head_ids = head_idx_cpu.unsqueeze(1).expand(n_heads, K).reshape(-1)
+            sel_positions = pos_slice[selected_pos]  # (K,) CPU
+            positions_flat = sel_positions.unsqueeze(0).expand(n_heads, K).reshape(-1)
             buckets_flat = bkt_slice[selected_pos].unsqueeze(0).expand(n_heads, K).reshape(-1)
             examples_flat = torch.full(
-                (n_heads * K,), fill_value=example_id, device=device, dtype=torch.int64,
+                (n_heads * K,), fill_value=example_id, dtype=torch.int64,
             )
 
             all_vectors.append(vectors_flat)
@@ -320,9 +334,8 @@ class Sniffer:
 
             if token_strings is not None and all_tokens is not None:
                 token_slice = list(token_strings[batch_idx])[:valid_length]
-                sel_pos_cpu = selected_pos.cpu().tolist()
-                tokens_at_pos = [token_slice[p] for p in sel_pos_cpu]
-                # Replicate for each head (same tokens at same positions)
+                sel_pos_list = selected_pos.tolist()
+                tokens_at_pos = [token_slice[p] for p in sel_pos_list]
                 for _ in range(n_heads):
                     all_tokens.extend(tokens_at_pos)
 
@@ -335,7 +348,6 @@ class Sniffer:
         positions_joined = torch.cat(all_positions) if len(all_positions) > 1 else all_positions[0]
         buckets_joined = torch.cat(all_buckets) if len(all_buckets) > 1 else all_buckets[0]
 
-        # Store in pending capture keyed by (layer, kind) instead of (layer, head, kind)
         key = f"l{layer_idx:02d}{vector_kind}"
         pending = self._pending_captures.get(key)
         has_tokens = token_strings is not None
