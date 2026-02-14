@@ -36,7 +36,7 @@ capture:
   min_bucket_size: 2048
   sampler:
     type: uniform
-    base_rate: 10.0
+    base_rate: 5.0
 
 output:
   data_root: data/attention-plasticity
