@@ -42,29 +42,44 @@ class SnifferConfig:
 
 
 @dataclass(slots=True)
+class _PendingChunk:
+    """One batch item's captured data for a (layer, kind) pair.
+
+    Vectors are (n_heads, K, dim) on the model device; positions/buckets
+    are shared across heads and stored as CPU numpy arrays of length K.
+    """
+    vectors: torch.Tensor           # (n_heads, K, dim) on device
+    positions: np.ndarray           # (K,) int64 CPU
+    buckets: np.ndarray             # (K,) int64 CPU
+    example_id: int
+    token_strings: Optional[List[str]]  # K strings or None
+
+
+@dataclass(slots=True)
 class _PendingCapture:
     layer_idx: int
     vector_kind: Literal["q", "k"]
     sliding_window: Optional[int]
-    vectors: List[torch.Tensor] = field(default_factory=list)
-    head_indices: List[torch.Tensor] = field(default_factory=list)
-    example_ids: List[torch.Tensor] = field(default_factory=list)
-    positions: List[torch.Tensor] = field(default_factory=list)
-    buckets: List[torch.Tensor] = field(default_factory=list)
-    token_strings: Optional[List[str]] = None
+    head_indices: List[int]
+    chunks: List[_PendingChunk] = field(default_factory=list)
 
 
 @dataclass(slots=True)
 class _AccumulatedCapture:
+    """Accumulated data for a (layer, kind) pair across all batches.
+
+    Vectors are (n_heads, K_i, dim) per chunk.  Positions, buckets, and
+    example ids are shared across heads — stored once per chunk.
+    """
     layer_idx: int
-    head_idx: int
     vector_kind: Literal["q", "k"]
     sliding_window: Optional[int]
-    vectors: List[np.ndarray] = field(default_factory=list)
-    buckets: List[np.ndarray] = field(default_factory=list)
-    example_ids: List[np.ndarray] = field(default_factory=list)
-    positions: List[np.ndarray] = field(default_factory=list)
-    token_strings: Optional[List[str]] = None
+    head_indices: List[int]
+    vectors: List[np.ndarray] = field(default_factory=list)         # each (n_heads, K_i, dim)
+    positions: List[np.ndarray] = field(default_factory=list)       # each (K_i,)
+    buckets: List[np.ndarray] = field(default_factory=list)         # each (K_i,)
+    example_ids: List[int] = field(default_factory=list)            # one int per chunk
+    token_strings: Optional[List[List[str]]] = None                 # each K_i strings
     total_rows: int = 0
 
 
@@ -192,22 +207,36 @@ class Sniffer:
 
     def close(self) -> None:
         self.flush_batch()
-        for key, acc in self._accumulated.items():
-            if acc.total_rows == 0:
+        for acc in self._accumulated.values():
+            if not acc.vectors:
                 continue
-            vectors = np.concatenate(acc.vectors) if len(acc.vectors) > 1 else acc.vectors[0]
-            buckets = np.concatenate(acc.buckets) if len(acc.buckets) > 1 else acc.buckets[0]
-            example_ids = np.concatenate(acc.example_ids) if len(acc.example_ids) > 1 else acc.example_ids[0]
-            positions = np.concatenate(acc.positions) if len(acc.positions) > 1 else acc.positions[0]
-            self.saver.write_config_data(
-                key,
-                vectors=vectors,
-                buckets=buckets,
-                example_ids=example_ids,
-                positions=positions,
-                sliding_window=acc.sliding_window,
-                token_strings=acc.token_strings,
-            )
+            n_chunks = len(acc.vectors)
+            # Concatenate along positions axis: (n_heads, total_K, dim)
+            all_vectors = np.concatenate(acc.vectors, axis=1) if n_chunks > 1 else acc.vectors[0]
+            # Shared across heads — one copy
+            all_positions = np.concatenate(acc.positions) if n_chunks > 1 else acc.positions[0]
+            all_buckets = np.concatenate(acc.buckets) if n_chunks > 1 else acc.buckets[0]
+            all_example_ids = np.concatenate([
+                np.full(pos.shape[0], eid, dtype=np.int64)
+                for pos, eid in zip(acc.positions, acc.example_ids)
+            ])
+            all_token_strings: Optional[List[str]] = None
+            if acc.token_strings is not None:
+                all_token_strings = []
+                for ts in acc.token_strings:
+                    all_token_strings.extend(ts)
+            # Write per head — only vectors differ; metadata is shared
+            for i, head_idx in enumerate(acc.head_indices):
+                config_name = f"l{acc.layer_idx:02d}h{head_idx:02d}{acc.vector_kind}"
+                self.saver.write_config_data(
+                    config_name,
+                    vectors=all_vectors[i],  # (total_K, dim)
+                    buckets=all_buckets,
+                    example_ids=all_example_ids,
+                    positions=all_positions,
+                    sliding_window=acc.sliding_window,
+                    token_strings=all_token_strings,
+                )
         self._accumulated.clear()
         self.saver.close()
 
@@ -252,9 +281,9 @@ class Sniffer:
     ) -> None:
         """Capture vectors for selected positions across all active heads.
 
-        Positions/buckets are CPU tensors; sampling and nonzero happen on CPU
-        (instant) to avoid CUDA synchronisation.  Only the small index tensor
-        is sent to the GPU for async vector gathering.
+        Vectors are kept as (n_heads, K, dim) per batch item — positions and
+        buckets are shared across heads and stored once.  Only the small index
+        tensor is sent to the GPU for async vector gathering.
         """
         batch_size, num_heads, _, _ = states.shape
         head_indices_list = self._head_indices(
@@ -265,34 +294,36 @@ class Sniffer:
         if not head_indices_list:
             return
 
-        device = states.device  # GPU (or CPU in tests)
-        n_heads = len(head_indices_list)
-        all_heads = n_heads == num_heads
-        # CPU tensor for metadata; GPU copy only needed for non-trivial head selection
-        head_idx_cpu = torch.tensor(list(head_indices_list), dtype=torch.int64)
+        device = states.device
+        all_heads = len(head_indices_list) == num_heads
         head_idx_gpu = (
-            head_idx_cpu.to(device=device, non_blocking=True)
-            if not all_heads and device.type != "cpu"
-            else head_idx_cpu
+            torch.tensor(list(head_indices_list), dtype=torch.int64, device=device)
+            if not all_heads else None
         )
 
-        all_vectors: List[torch.Tensor] = []
-        all_head_ids: List[torch.Tensor] = []
-        all_examples: List[torch.Tensor] = []
-        all_positions: List[torch.Tensor] = []
-        all_buckets: List[torch.Tensor] = []
-        all_tokens: Optional[List[str]] = [] if token_strings is not None else None
+        key = f"l{layer_idx:02d}{vector_kind}"
+        pending = self._pending_captures.get(key)
+        if pending is None:
+            pending = _PendingCapture(
+                layer_idx=layer_idx,
+                vector_kind=vector_kind,  # type: ignore[arg-type]
+                sliding_window=sliding_window,
+                head_indices=list(head_indices_list),
+            )
+            self._pending_captures[key] = pending
+        elif pending.sliding_window != sliding_window:
+            raise ValueError(
+                f"Inconsistent sliding_window for {key}: {pending.sliding_window} vs {sliding_window}."
+            )
 
         for batch_idx in range(batch_size):
             valid_length = valid_lengths[batch_idx]
             if valid_length <= 0:
                 continue
             example_id = int(example_ids[batch_idx])
-            # positions and buckets are CPU tensors
             pos_slice = positions[batch_idx, :valid_length]
             bkt_slice = buckets[batch_idx, :valid_length]
 
-            # Sample on CPU — mask is CPU, nonzero is instant (no CUDA sync)
             mask = self.sampler.sample_positions_batch(
                 layer_idx=layer_idx,
                 head_indices=head_indices_list,
@@ -310,153 +341,93 @@ class Sniffer:
             if mask.dtype != torch.bool:
                 mask = mask.to(dtype=torch.bool)
 
-            # CPU nonzero — instant, no GPU sync
-            selected_pos = mask.nonzero(as_tuple=False).squeeze(1)  # (K,)
+            selected_pos = mask.nonzero(as_tuple=False).squeeze(1)
             if selected_pos.ndim == 0:
                 selected_pos = selected_pos.unsqueeze(0)
             K = selected_pos.shape[0]
             if K == 0:
                 continue
 
-            # Per-batch-item downsample on CPU
             if self._max_rows_per_batch is not None and K > self._max_rows_per_batch:
                 limit = self._max_rows_per_batch
-                gen = torch.Generator()  # CPU generator
+                gen = torch.Generator()
                 gen.manual_seed(self._subsample_seed(
-                    layer_idx=layer_idx, head_idx=int(head_idx_cpu[0].item()),
+                    layer_idx=layer_idx, head_idx=int(head_indices_list[0]),
                     vector_kind=vector_kind, example_id=example_id,
                 ))
                 perm = torch.randperm(K, generator=gen)
                 selected_pos = selected_pos[perm[:limit]]
                 K = limit
 
-            # Send only the small index tensor to GPU (async, non-blocking)
             selected_pos_gpu = selected_pos.to(device=device, non_blocking=True)
-
-            # Gather vectors: position-first (small) then head-select
             at_pos = states[batch_idx, :, selected_pos_gpu]  # (total_heads, K, dim)
             vectors = at_pos if all_heads else at_pos[head_idx_gpu]  # (n_heads, K, dim)
-            vectors_flat = vectors.reshape(n_heads * K, -1)
 
-            # Metadata stays on CPU
-            head_ids = head_idx_cpu.unsqueeze(1).expand(n_heads, K).reshape(-1)
-            sel_positions = pos_slice[selected_pos]  # (K,) CPU
-            positions_flat = sel_positions.unsqueeze(0).expand(n_heads, K).reshape(-1)
-            buckets_flat = bkt_slice[selected_pos].unsqueeze(0).expand(n_heads, K).reshape(-1)
-            examples_flat = torch.full(
-                (n_heads * K,), fill_value=example_id, dtype=torch.int64,
-            )
+            # Shared metadata stays on CPU as numpy
+            sel_positions_np = pos_slice[selected_pos].numpy()
+            sel_buckets_np = bkt_slice[selected_pos].numpy()
 
-            all_vectors.append(vectors_flat)
-            all_head_ids.append(head_ids)
-            all_examples.append(examples_flat)
-            all_positions.append(positions_flat)
-            all_buckets.append(buckets_flat)
-
-            if token_strings is not None and all_tokens is not None:
+            chunk_tokens: Optional[List[str]] = None
+            if token_strings is not None:
                 token_slice = list(token_strings[batch_idx])[:valid_length]
                 sel_pos_list = selected_pos.tolist()
-                tokens_at_pos = [token_slice[p] for p in sel_pos_list]
-                for _ in range(n_heads):
-                    all_tokens.extend(tokens_at_pos)
+                chunk_tokens = [token_slice[p] for p in sel_pos_list]
 
-        if not all_vectors:
-            return
-
-        vectors_joined = torch.cat(all_vectors) if len(all_vectors) > 1 else all_vectors[0]
-        head_ids_joined = torch.cat(all_head_ids) if len(all_head_ids) > 1 else all_head_ids[0]
-        examples_joined = torch.cat(all_examples) if len(all_examples) > 1 else all_examples[0]
-        positions_joined = torch.cat(all_positions) if len(all_positions) > 1 else all_positions[0]
-        buckets_joined = torch.cat(all_buckets) if len(all_buckets) > 1 else all_buckets[0]
-
-        key = f"l{layer_idx:02d}{vector_kind}"
-        pending = self._pending_captures.get(key)
-        has_tokens = token_strings is not None
-        if pending is None:
-            pending = _PendingCapture(
-                layer_idx=layer_idx,
-                vector_kind=vector_kind,  # type: ignore[arg-type]
-                sliding_window=sliding_window,
-                token_strings=[] if has_tokens else None,
-            )
-            self._pending_captures[key] = pending
-        elif pending.sliding_window != sliding_window:
-            raise ValueError(
-                f"Inconsistent sliding_window for {key}: {pending.sliding_window} vs {sliding_window}."
-            )
-        if (pending.token_strings is None) != (not has_tokens):
-            raise ValueError(f"Inconsistent token string capture for {key} within the same batch.")
-        pending.vectors.append(vectors_joined)
-        pending.head_indices.append(head_ids_joined)
-        pending.example_ids.append(examples_joined)
-        pending.positions.append(positions_joined)
-        pending.buckets.append(buckets_joined)
-        if pending.token_strings is not None:
-            pending.token_strings.extend(all_tokens or [])
+            pending.chunks.append(_PendingChunk(
+                vectors=vectors,
+                positions=sel_positions_np,
+                buckets=sel_buckets_np,
+                example_id=example_id,
+                token_strings=chunk_tokens,
+            ))
 
     def flush_batch(self) -> None:
         if not self._pending_captures:
             return
         flush_start = perf_counter()
+        # Synchronize GPU once per device before CPU transfer
         seen_devices: Set[torch.device] = set()
         for pending in self._pending_captures.values():
-            if not pending.vectors:
+            if not pending.chunks:
                 continue
-            device = pending.vectors[0].device
-            if device in seen_devices:
-                continue
-            _synchronize_device(device)
-            seen_devices.add(device)
+            device = pending.chunks[0].vectors.device
+            if device not in seen_devices:
+                _synchronize_device(device)
+                seen_devices.add(device)
 
         for pending in self._pending_captures.values():
-            if not pending.vectors:
+            if not pending.chunks:
                 continue
-            vectors = torch.cat(pending.vectors, dim=0) if len(pending.vectors) > 1 else pending.vectors[0]
-            head_indices = (
-                torch.cat(pending.head_indices, dim=0) if len(pending.head_indices) > 1 else pending.head_indices[0]
-            )
-            example_ids = (
-                torch.cat(pending.example_ids, dim=0) if len(pending.example_ids) > 1 else pending.example_ids[0]
-            )
-            positions = torch.cat(pending.positions, dim=0) if len(pending.positions) > 1 else pending.positions[0]
-            buckets = torch.cat(pending.buckets, dim=0) if len(pending.buckets) > 1 else pending.buckets[0]
+            acc_key = f"l{pending.layer_idx:02d}{pending.vector_kind}"
+            acc = self._accumulated.get(acc_key)
+            if acc is None:
+                acc = _AccumulatedCapture(
+                    layer_idx=pending.layer_idx,
+                    vector_kind=pending.vector_kind,
+                    sliding_window=pending.sliding_window,
+                    head_indices=list(pending.head_indices),
+                )
+                self._accumulated[acc_key] = acc
 
-            # Batch GPU→CPU transfer (few large copies instead of many small ones)
-            vectors_np = vectors.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy()
-            head_indices_np = head_indices.detach().to(device="cpu", dtype=torch.int64).contiguous().numpy()
-            example_ids_np = example_ids.detach().to(device="cpu", dtype=torch.int64).contiguous().numpy()
-            positions_np = positions.detach().to(device="cpu", dtype=torch.int64).contiguous().numpy()
-            buckets_np = buckets.detach().to(device="cpu", dtype=torch.int64).contiguous().numpy()
-
-            # Split by head on CPU and accumulate dense numpy arrays
-            unique_heads = np.unique(head_indices_np)
-            for head_idx in unique_heads:
-                mask = head_indices_np == int(head_idx)
-                h_vectors = vectors_np[mask]
-                row_count = h_vectors.shape[0]
-                if row_count == 0:
-                    continue
-                config_key = f"l{pending.layer_idx:02d}h{int(head_idx):02d}{pending.vector_kind}"
-                acc = self._accumulated.get(config_key)
-                if acc is None:
-                    acc = _AccumulatedCapture(
-                        layer_idx=pending.layer_idx,
-                        head_idx=int(head_idx),
-                        vector_kind=pending.vector_kind,
-                        sliding_window=pending.sliding_window,
-                        token_strings=[] if pending.token_strings is not None else None,
-                    )
-                    self._accumulated[config_key] = acc
-                acc.vectors.append(h_vectors)
-                acc.buckets.append(buckets_np[mask])
-                acc.example_ids.append(example_ids_np[mask])
-                acc.positions.append(positions_np[mask])
-                if pending.token_strings is not None and acc.token_strings is not None:
-                    indices = np.where(mask)[0]
-                    acc.token_strings.extend(pending.token_strings[i] for i in indices)
-                acc.total_rows += row_count
+            n_heads = len(pending.head_indices)
+            for chunk in pending.chunks:
+                # GPU→CPU transfer: one copy of (n_heads, K, dim)
+                vectors_np = chunk.vectors.detach().to(
+                    device="cpu", dtype=torch.float32,
+                ).contiguous().numpy()
+                K = chunk.positions.shape[0]
+                acc.vectors.append(vectors_np)
+                acc.positions.append(chunk.positions)
+                acc.buckets.append(chunk.buckets)
+                acc.example_ids.append(chunk.example_id)
+                if chunk.token_strings is not None:
+                    if acc.token_strings is None:
+                        acc.token_strings = []
+                    acc.token_strings.append(chunk.token_strings)
+                acc.total_rows += K * n_heads
                 self._captured_payloads += 1
-                self._captured_rows += row_count
+                self._captured_rows += K * n_heads
+
         self._pending_captures.clear()
         self._flush_invocations += 1
         self._flush_time_s += perf_counter() - flush_start
