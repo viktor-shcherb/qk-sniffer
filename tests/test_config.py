@@ -79,7 +79,7 @@ def test_resolve_readme_path_absolute(tmp_path):
     assert resolved == Path("data/sniffed-qk/README.md")
 
 
-def test_load_config_parses_distributed_inference_settings(tmp_path):
+def test_load_config_ignores_removed_distributed_fields(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         """
@@ -105,8 +105,8 @@ output:
     )
 
     config = sniff.load_config(config_path)
-    assert config.inference.distributed is True
-    assert config.inference.backend == "nccl"
+    assert config.inference.batch_size == 4
+    assert not hasattr(config.inference, "distributed")
 
 
 def test_load_config_parses_debug_inference_settings(tmp_path):

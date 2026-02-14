@@ -246,7 +246,7 @@ def test_run_inference_non_cuda_auto_device_map_falls_back_to_none(tmp_path, mon
     assert captured_loader_kwargs["device_map"] is None
 
 
-def test_maybe_place_single_process_model_moves_to_mps_and_casts_dtype(monkeypatch):
+def test_maybe_place_model_moves_to_mps_and_casts_dtype(monkeypatch):
     class _TrackModel:
         def __init__(self):
             self.calls = []
@@ -258,9 +258,8 @@ def test_maybe_place_single_process_model_moves_to_mps_and_casts_dtype(monkeypat
     model = _TrackModel()
     monkeypatch.setattr(sniff.torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(sniff, "_mps_is_available", lambda: True)
-    placed = sniff._maybe_place_single_process_model(
+    placed = sniff._maybe_place_model(
         model,
-        distributed=sniff.DistributedContext(enabled=False),
         requested_device_map=None,
         requested_dtype=torch.bfloat16,
     )
@@ -272,7 +271,7 @@ def test_maybe_place_single_process_model_moves_to_mps_and_casts_dtype(monkeypat
     assert kwargs["dtype"] == torch.float16
 
 
-def test_maybe_place_single_process_model_moves_to_cuda(monkeypatch):
+def test_maybe_place_model_moves_to_cuda(monkeypatch):
     class _TrackModel:
         def __init__(self):
             self.calls = []
@@ -283,9 +282,8 @@ def test_maybe_place_single_process_model_moves_to_cuda(monkeypatch):
 
     model = _TrackModel()
     monkeypatch.setattr(sniff.torch.cuda, "is_available", lambda: True)
-    placed = sniff._maybe_place_single_process_model(
+    placed = sniff._maybe_place_model(
         model,
-        distributed=sniff.DistributedContext(enabled=False),
         requested_device_map=None,
         requested_dtype=torch.float16,
     )
@@ -604,208 +602,6 @@ def test_run_inference_sampling_excludes_sliding_layers_when_full_attention_only
     assert 0 not in sniffer_config.sampled_query_heads
     assert 2 not in sniffer_config.sampled_query_heads
     assert sniffer_config.metadata["attention_scope"] == "full_only"
-
-
-def test_run_inference_distributed_non_main_uses_rank_output_and_skips_remote_sync(tmp_path, monkeypatch):
-    data_root = tmp_path / "captures"
-    events: list[str] = []
-    captured_configs = []
-    captured_ids = []
-
-    monkeypatch.setattr(sniff, "patch_modeling_modules", lambda *_, **__: None)
-    monkeypatch.setattr(sniff, "_resolve_distributed_context", lambda *_: sniff.DistributedContext(enabled=True, rank=1, local_rank=1, world_size=2, is_main=False))
-    monkeypatch.setattr(sniff, "_distributed_barrier", lambda *_: None)
-    monkeypatch.setattr(sniff, "_destroy_distributed_context", lambda *_: None)
-    monkeypatch.setattr(sniff, "pull_remote_dataset", lambda *_: events.append("pull"))
-    monkeypatch.setattr(sniff, "push_remote_dataset", lambda *_: events.append("push"))
-    monkeypatch.setattr(sniff, "merge_rank_outputs", lambda *_: events.append("merge"))
-    monkeypatch.setattr(sniff, "load_hf_dataset", lambda *_: _FakeDataset(["a", "b", "c", "d"]))
-    monkeypatch.setattr(sniff, "prepare_tokenizer", lambda *_, **__: _FakeTokenizer())
-    monkeypatch.setattr(sniff, "prepare_model_config", lambda *_: None)
-
-    class _FakeAutoModel:
-        @staticmethod
-        def from_pretrained(*args, **kwargs):
-            return _FakeModel()
-
-    monkeypatch.setattr(sniff, "AutoModelForCausalLM", _FakeAutoModel)
-
-    @contextmanager
-    def fake_activate_sniffer(sniffer_config):
-        captured_configs.append(sniffer_config)
-        yield object()
-
-    monkeypatch.setattr(sniff, "activate_sniffer", fake_activate_sniffer)
-    monkeypatch.setattr(sniff, "set_active_sequence_lengths", lambda *_: None)
-    monkeypatch.setattr(sniff, "tqdm", lambda *args, **kwargs: _DummyProgress(*args, **kwargs))
-
-    def capture_ids(ids):
-        captured_ids.append(list(ids))
-
-    monkeypatch.setattr(sniff, "set_active_example_ids", capture_ids)
-
-    config = sniff.SniffConfig(
-        dataset=sniff.DatasetSettings(path="dummy", split="train", text_column="text"),
-        model=sniff.ModelSettings(name="fake-model", dtype="float16"),
-        tokenizer=sniff.TokenizerSettings(name="fake-tokenizer"),
-        inference=sniff.InferenceSettings(batch_size=2, autocast_dtype="float16", distributed=True),
-        capture=sniff.CaptureSettings(),
-        output=sniff.OutputSettings(
-            data_root=str(data_root),
-            readme_path="README.md",
-            hf_repo_id="dummy/sniffed-qk",
-        ),
-    )
-
-    sniff.run_inference(config)
-
-    assert events == []
-    assert captured_configs
-    dist_root = data_root.parent / f".{data_root.name}_dist_work"
-    assert Path(captured_configs[0].data_root) == dist_root / "rank00001"
-    assert captured_ids
-    # Rank 1 with world_size=2 should produce rank-aware global IDs for no-id datasets.
-    assert captured_ids[0] == [1, 3]
-
-
-def test_run_inference_distributed_main_pulls_merges_and_pushes(tmp_path, monkeypatch):
-    data_root = tmp_path / "captures"
-    events: list[str] = []
-    captured_configs = []
-
-    monkeypatch.setattr(sniff, "patch_modeling_modules", lambda *_, **__: None)
-    monkeypatch.setattr(sniff, "_resolve_distributed_context", lambda *_: sniff.DistributedContext(enabled=True, rank=0, local_rank=0, world_size=2, is_main=True))
-    monkeypatch.setattr(sniff, "_distributed_barrier", lambda *_: None)
-    monkeypatch.setattr(sniff, "_destroy_distributed_context", lambda *_: None)
-    monkeypatch.setattr(sniff, "pull_remote_dataset", lambda *_: events.append("pull"))
-    monkeypatch.setattr(sniff, "push_remote_dataset", lambda *_: events.append("push"))
-    monkeypatch.setattr(sniff, "load_hf_dataset", lambda *_: _FakeDataset(["x", "y", "z", "w"]))
-    monkeypatch.setattr(sniff, "prepare_tokenizer", lambda *_, **__: _FakeTokenizer())
-    monkeypatch.setattr(sniff, "prepare_model_config", lambda *_: None)
-
-    class _FakeAutoModel:
-        @staticmethod
-        def from_pretrained(*args, **kwargs):
-            return _FakeModel()
-
-    monkeypatch.setattr(sniff, "AutoModelForCausalLM", _FakeAutoModel)
-
-    @contextmanager
-    def fake_activate_sniffer(sniffer_config):
-        captured_configs.append(sniffer_config)
-        yield object()
-
-    monkeypatch.setattr(sniff, "activate_sniffer", fake_activate_sniffer)
-    monkeypatch.setattr(sniff, "set_active_example_ids", lambda *_: None)
-    monkeypatch.setattr(sniff, "set_active_sequence_lengths", lambda *_: None)
-    monkeypatch.setattr(sniff, "tqdm", lambda *args, **kwargs: _DummyProgress(*args, **kwargs))
-
-    def fake_merge(rank_roots, settings):
-        _ = rank_roots, settings
-        events.append("merge")
-
-    monkeypatch.setattr(sniff, "merge_rank_outputs", fake_merge)
-
-    config = sniff.SniffConfig(
-        dataset=sniff.DatasetSettings(path="dummy", split="train", text_column="text"),
-        model=sniff.ModelSettings(name="fake-model", dtype="float16"),
-        tokenizer=sniff.TokenizerSettings(name="fake-tokenizer"),
-        inference=sniff.InferenceSettings(batch_size=2, autocast_dtype="float16", distributed=True),
-        capture=sniff.CaptureSettings(),
-        output=sniff.OutputSettings(
-            data_root=str(data_root),
-            readme_path="README.md",
-            hf_repo_id="dummy/sniffed-qk",
-        ),
-    )
-
-    sniff.run_inference(config)
-
-    assert events == ["pull", "merge", "push"]
-    assert captured_configs
-    dist_root = data_root.parent / f".{data_root.name}_dist_work"
-    assert Path(captured_configs[0].data_root) == dist_root / "rank00000"
-
-
-def test_run_inference_distributed_max_samples_is_global(tmp_path, monkeypatch):
-    data_root = tmp_path / "captures"
-    captured_ids: list[list[int]] = []
-
-    class _FakeHFMapDataset:
-        def __init__(self, texts: list[str]):
-            self._texts = list(texts)
-
-        def __len__(self) -> int:
-            return len(self._texts)
-
-        def __getitem__(self, key):
-            if isinstance(key, slice):
-                return {"text": self._texts[key]}
-            raise TypeError("Fake dataset only supports slicing")
-
-        def select(self, indices):
-            return _FakeHFMapDataset([self._texts[idx] for idx in indices])
-
-        def shard(self, num_shards: int, index: int):
-            return _FakeHFMapDataset([text for idx, text in enumerate(self._texts) if idx % num_shards == index])
-
-    monkeypatch.setattr(sniff, "patch_modeling_modules", lambda *_, **__: None)
-    monkeypatch.setattr(
-        sniff,
-        "_resolve_distributed_context",
-        lambda *_: sniff.DistributedContext(enabled=True, rank=1, local_rank=1, world_size=2, is_main=False),
-    )
-    monkeypatch.setattr(sniff, "_distributed_barrier", lambda *_: None)
-    monkeypatch.setattr(sniff, "_destroy_distributed_context", lambda *_: None)
-    monkeypatch.setattr(sniff, "pull_remote_dataset", lambda *_: None)
-    monkeypatch.setattr(sniff, "push_remote_dataset", lambda *_: None)
-    monkeypatch.setattr(sniff, "merge_rank_outputs", lambda *_: None)
-    monkeypatch.setattr(
-        sniff,
-        "load_dataset",
-        lambda *_, **__: _FakeHFMapDataset(["a", "b", "c", "d", "e", "f", "g", "h"]),
-    )
-    monkeypatch.setattr(sniff, "prepare_tokenizer", lambda *_, **__: _FakeTokenizer())
-    monkeypatch.setattr(sniff, "prepare_model_config", lambda *_: None)
-    monkeypatch.setattr(sniff, "set_active_sequence_lengths", lambda *_: None)
-    monkeypatch.setattr(sniff, "tqdm", lambda *args, **kwargs: _DummyProgress(*args, **kwargs))
-
-    class _FakeAutoModel:
-        @staticmethod
-        def from_pretrained(*args, **kwargs):
-            return _FakeModel()
-
-    monkeypatch.setattr(sniff, "AutoModelForCausalLM", _FakeAutoModel)
-
-    @contextmanager
-    def fake_activate_sniffer(_):
-        yield object()
-
-    monkeypatch.setattr(sniff, "activate_sniffer", fake_activate_sniffer)
-    monkeypatch.setattr(sniff, "set_active_example_ids", lambda ids: captured_ids.append(list(ids)))
-
-    config = sniff.SniffConfig(
-        dataset=sniff.DatasetSettings(
-            path="dummy",
-            split="train",
-            text_column="text",
-            max_samples=3,
-        ),
-        model=sniff.ModelSettings(name="fake-model", dtype="float16"),
-        tokenizer=sniff.TokenizerSettings(name="fake-tokenizer"),
-        inference=sniff.InferenceSettings(batch_size=4, autocast_dtype="float16", distributed=True),
-        capture=sniff.CaptureSettings(),
-        output=sniff.OutputSettings(
-            data_root=str(data_root),
-            readme_path="README.md",
-            hf_repo_id="dummy/sniffed-qk",
-        ),
-    )
-
-    sniff.run_inference(config)
-
-    # max_samples is global (cap to first 3 examples), then rank-1 shard keeps only index 1.
-    assert captured_ids == [[1]]
 
 
 def test_push_remote_dataset_uses_branch_revision(tmp_path, monkeypatch):

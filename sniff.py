@@ -4,13 +4,11 @@ import argparse
 import gc
 import importlib
 import json
-import os
 import random
 import sys
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 import hashlib
-import re
 import shutil
 from pathlib import Path
 from time import perf_counter
@@ -105,8 +103,6 @@ class TokenizerSettings:
 class InferenceSettings:
     batch_size: int = 1
     autocast_dtype: str = "float16"
-    distributed: bool = False
-    backend: str = "auto"
     debug_logging: bool = False
     debug_log_every_n_batches: int = 1
     mps_cleanup_every_batches: int = 0
@@ -140,9 +136,6 @@ DTYPE_ALIASES = {
     "float32": torch.float32,
     "fp32": torch.float32,
 }
-
-_CONFIG_NAME_RE = re.compile(r"^l(\d{2})h(\d{2})([qk])$")
-
 
 def _debug_log(enabled: bool, message: str) -> None:
     if enabled:
@@ -178,11 +171,13 @@ def load_config(config_path: Path) -> SniffConfig:
         capture_raw["head_sampling"] = None
     else:
         raise ValueError("capture.head_sampling must be an object with fields like count/seed, or null.")
+    # Strip unknown fields (e.g. removed 'distributed'/'backend') for backwards compatibility.
+    inference_raw = {k: v for k, v in raw["inference"].items() if k in InferenceSettings.__dataclass_fields__}
     return SniffConfig(
         dataset=DatasetSettings(**raw["dataset"]),
         model=ModelSettings(**raw["model"]),
         tokenizer=TokenizerSettings(**raw["tokenizer"]),
-        inference=InferenceSettings(**raw["inference"]),
+        inference=InferenceSettings(**inference_raw),
         capture=CaptureSettings(**capture_raw),
         output=OutputSettings(**raw["output"]),
     )
@@ -466,84 +461,6 @@ def resolve_primary_device(model: AutoModelForCausalLM) -> torch.device:
     return torch.device("cpu")
 
 
-@dataclass
-class DistributedContext:
-    enabled: bool = False
-    rank: int = 0
-    local_rank: int = 0
-    world_size: int = 1
-    is_main: bool = True
-    initialized_here: bool = False
-
-
-def _resolve_distributed_context(settings: InferenceSettings) -> DistributedContext:
-    dist = torch.distributed
-    env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    env_rank = int(os.environ.get("RANK", "0"))
-    env_local_rank = int(os.environ.get("LOCAL_RANK", str(env_rank)))
-    already_initialized = bool(dist.is_available() and dist.is_initialized())
-    enabled = bool(settings.distributed or env_world_size > 1 or already_initialized)
-    if not enabled:
-        return DistributedContext()
-    if not dist.is_available():
-        raise RuntimeError("Distributed inference requested but torch.distributed is unavailable.")
-
-    backend = settings.backend.lower().strip()
-    if backend == "auto":
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-    if backend == "nccl" and not torch.cuda.is_available():
-        raise RuntimeError("NCCL backend requires CUDA devices.")
-
-    if torch.cuda.is_available():
-        torch.cuda.set_device(env_local_rank)
-
-    initialized_here = False
-    if not dist.is_initialized():
-        if env_world_size <= 1:
-            raise RuntimeError(
-                "Distributed inference requires WORLD_SIZE > 1. "
-                "Launch with torchrun (for example: torchrun --nproc_per_node=2 sniff.py --config ...)."
-            )
-        dist.init_process_group(
-            backend=backend,
-            rank=env_rank,
-            world_size=env_world_size,
-        )
-        initialized_here = True
-
-    rank = int(dist.get_rank())
-    world_size = int(dist.get_world_size())
-    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
-    return DistributedContext(
-        enabled=True,
-        rank=rank,
-        local_rank=local_rank,
-        world_size=world_size,
-        is_main=rank == 0,
-        initialized_here=initialized_here,
-    )
-
-
-def _distributed_barrier(ctx: DistributedContext) -> None:
-    if not ctx.enabled:
-        return
-    dist = torch.distributed
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
-
-
-def _destroy_distributed_context(ctx: DistributedContext) -> None:
-    if not ctx.enabled or not ctx.initialized_here:
-        return
-    dist = torch.distributed
-    if dist.is_available() and dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def _distributed_work_root(data_root: Path) -> Path:
-    return data_root.parent / f".{data_root.name}_dist_work"
-
-
 def _mps_is_available() -> bool:
     backend = getattr(torch.backends, "mps", None)
     if backend is None:
@@ -554,13 +471,7 @@ def _mps_is_available() -> bool:
         return False
 
 
-def _normalize_device_map_for_runtime(
-    device_map: Optional[Any],
-    *,
-    distributed: DistributedContext,
-) -> Optional[Any]:
-    if distributed.enabled:
-        return device_map
+def _normalize_device_map_for_runtime(device_map: Optional[Any]) -> Optional[Any]:
     if isinstance(device_map, str) and device_map.lower() == "auto" and not torch.cuda.is_available():
         # Avoid Accelerate meta/device-map flows on non-CUDA backends (notably MPS),
         # which can leave placeholder storages unmaterialized during eager inference.
@@ -569,15 +480,12 @@ def _normalize_device_map_for_runtime(
     return device_map
 
 
-def _maybe_place_single_process_model(
+def _maybe_place_model(
     model: AutoModelForCausalLM,
     *,
-    distributed: DistributedContext,
     requested_device_map: Optional[Any],
     requested_dtype: torch.dtype,
 ):
-    if distributed.enabled:
-        return model
     if requested_device_map is not None:
         return model
     if not hasattr(model, "to"):
@@ -593,17 +501,6 @@ def _maybe_place_single_process_model(
         target_dtype = torch.float16
         print("[sniff] Using float16 on MPS (requested bfloat16).")
     return model.to(device=torch.device("mps"), dtype=target_dtype)
-
-
-def _rank_output_settings(base: OutputSettings, rank_root: Path) -> OutputSettings:
-    return OutputSettings(
-        data_root=str(rank_root),
-        readme_path="README.md",
-        hf_repo_id=None,
-        hf_branch=base.hf_branch,
-        private=base.private,
-        write_batch_size=base.write_batch_size,
-    )
 
 
 def build_sampler_factory(settings: SamplerSettings, *, min_bucket_size: int):
@@ -818,31 +715,15 @@ def batch_iter(dataset: Dataset | IterableDataset, settings: DatasetSettings, ba
         yield {"texts": texts, "example_ids": ids}
 
 
-def _shard_dataset_for_rank(
-    dataset: Dataset | IterableDataset,
-    *,
-    rank: int,
-    world_size: int,
-) -> Dataset | IterableDataset:
-    if world_size <= 1:
-        return dataset
-    return dataset.shard(num_shards=world_size, index=rank)
-
-
 def _estimate_total_rows(
     dataset: Dataset | IterableDataset,
     *,
     dataset_settings: DatasetSettings,
-    distributed: DistributedContext,
 ) -> Optional[int]:
     if isinstance(dataset, IterableDataset):
         if dataset_settings.max_samples is None:
             return None
-        if distributed.world_size <= 1:
-            return int(dataset_settings.max_samples)
-        per_rank = dataset_settings.max_samples // distributed.world_size
-        remainder = dataset_settings.max_samples % distributed.world_size
-        return per_rank + (1 if distributed.rank < remainder else 0)
+        return int(dataset_settings.max_samples)
     return len(dataset)
 
 
@@ -1049,442 +930,262 @@ def push_remote_dataset(settings: OutputSettings) -> None:
         print(f"[sniff] Failed to push dataset repo {settings.hf_repo_id}: {err}")
 
 
-def _load_rank_model_metadata(rank_root: Path) -> Tuple[Optional[str], Dict[str, Union[str, int, float]]]:
-    state_path = rank_root / "_saver_state.json"
-    if not state_path.exists():
-        return None, {}
-    try:
-        payload = json.loads(state_path.read_text(encoding="utf-8"))
-    except Exception:
-        return None, {}
-
-    model_name = payload.get("model_name")
-    metadata = payload.get("model_metadata")
-    if isinstance(model_name, str) and isinstance(metadata, dict):
-        cleaned = {
-            key: value
-            for key, value in metadata.items()
-            if isinstance(key, str) and isinstance(value, (str, int, float))
-        }
-        return model_name, cleaned
-
-    # Best-effort fallback for old state format.
-    if isinstance(metadata, dict) and metadata:
-        first_model_name = next(iter(metadata.keys()))
-        first_model_meta = metadata.get(first_model_name)
-        if isinstance(first_model_name, str) and isinstance(first_model_meta, dict):
-            cleaned = {
-                key: value
-                for key, value in first_model_meta.items()
-                if isinstance(key, str) and isinstance(value, (str, int, float))
-            }
-            return first_model_name, cleaned
-
-    return None, {}
-
-
-def _resolve_sliding_window_value(values: Sequence[Any]) -> Optional[int]:
-    non_null = {int(value) for value in values if value is not None}
-    if len(non_null) > 1:
-        raise ValueError(f"Inconsistent sliding_window values in rank shard: {sorted(non_null)}")
-    if not non_null:
-        return None
-    return next(iter(non_null))
-
-
-def merge_rank_outputs(rank_roots: Sequence[Path], output_settings: OutputSettings) -> None:
-    import numpy as np
-    import pyarrow.parquet as pq
-
-    from saver.dataset import CaptureBatch, DatasetSaver
-
-    final_root = Path(output_settings.data_root)
-    final_root.mkdir(parents=True, exist_ok=True)
-    readme_path = resolve_readme_path(output_settings)
-    saver = DatasetSaver(
-        root=final_root,
-        readme_path=readme_path,
-        write_batch_size=max(1, int(output_settings.write_batch_size)),
-    )
-    try:
-        fallback_model_name: Optional[str] = None
-        for rank_root in sorted(rank_roots):
-            model_name, metadata = _load_rank_model_metadata(rank_root)
-            if model_name:
-                saver.register_model_metadata(model_name, metadata)
-                fallback_model_name = model_name
-
-            for config_dir in sorted(rank_root.iterdir()):
-                if not config_dir.is_dir():
-                    continue
-                if config_dir.name.startswith("_"):
-                    continue
-                match = _CONFIG_NAME_RE.match(config_dir.name)
-                if match is None:
-                    continue
-                data_file = config_dir / "data.parquet"
-                if not data_file.exists():
-                    continue
-                table = pq.read_table(data_file)
-                if table.num_rows == 0:
-                    continue
-                token_strings: Optional[List[str]] = None
-                if "token_str" in table.schema.names:
-                    token_strings = table.column("token_str").to_pylist()
-                sliding_values = (
-                    table.column("sliding_window").to_pylist()
-                    if "sliding_window" in table.schema.names
-                    else [None] * table.num_rows
-                )
-                batch = CaptureBatch(
-                    model_name=model_name or fallback_model_name or "unknown/model",
-                    layer_idx=int(match.group(1)),
-                    head_idx=int(match.group(2)),
-                    vector_kind=match.group(3),  # type: ignore[arg-type]
-                    buckets=np.asarray(table.column("bucket").to_pylist(), dtype=np.int64),
-                    example_ids=np.asarray(table.column("example_id").to_pylist(), dtype=np.int64),
-                    positions=np.asarray(table.column("position").to_pylist(), dtype=np.int64),
-                    vectors=np.asarray(table.column("vector").to_pylist(), dtype=np.float32),
-                    sliding_window=_resolve_sliding_window_value(sliding_values),
-                    token_strings=token_strings,
-                )
-                saver.add_batch(batch)
-    finally:
-        saver.close()
-
-
 def run_inference(config: SniffConfig) -> None:
     patch_modeling_modules()
-    distributed = _resolve_distributed_context(config.inference)
     debug_logging = bool(config.inference.debug_logging)
     debug_log_every_n_batches = max(1, int(config.inference.debug_log_every_n_batches))
     _debug_log(
         debug_logging,
+        f"runtime setup: cuda_available={torch.cuda.is_available()}, mps_available={_mps_is_available()}",
+    )
+
+    pull_remote_dataset(config.output)
+    Path(config.output.data_root).mkdir(parents=True, exist_ok=True)
+
+    dataset_load_start = perf_counter()
+    dataset = load_hf_dataset(config.dataset)
+    _debug_log(
+        debug_logging,
         (
-            "runtime setup: "
-            f"distributed={distributed.enabled}, world_size={distributed.world_size}, "
-            f"rank={distributed.rank}, local_rank={distributed.local_rank}, "
-            f"cuda_available={torch.cuda.is_available()}, mps_available={_mps_is_available()}"
+            f"dataset loaded in {perf_counter() - dataset_load_start:.2f}s: "
+            f"path={config.dataset.path}, split={config.dataset.split}, streaming={config.dataset.streaming}"
         ),
     )
-    final_output_settings = config.output
-    final_data_root = Path(final_output_settings.data_root)
-    rank_output_settings = final_output_settings
-    dist_work_root: Optional[Path] = None
 
+    tokenizer_load_start = perf_counter()
+    tokenizer = prepare_tokenizer(config.tokenizer, config.model.name)
+    _debug_log(debug_logging, f"tokenizer prepared in {perf_counter() - tokenizer_load_start:.2f}s")
+    readme_path = resolve_readme_path(config.output)
+
+    torch_dtype = resolve_dtype(config.model.dtype)
+    model_config = prepare_model_config(config.model)
+    device_map = _normalize_device_map_for_runtime(config.model.device_map)
+
+    resolved_attn = _resolve_attn_implementation(config.model.attn_implementation)
+    if resolved_attn and resolved_attn != config.model.attn_implementation:
+        config.model.attn_implementation = resolved_attn
+    _debug_log(
+        debug_logging,
+        f"loading model: dtype={torch_dtype}, device_map={device_map!r}, attn={config.model.attn_implementation!r}",
+    )
+    model_load_start = perf_counter()
+    model = _load_model_from_pretrained(
+        settings=config.model,
+        model_config=model_config,
+        torch_dtype=torch_dtype,
+        device_map=device_map,
+    )
+    _debug_log(debug_logging, f"model loaded in {perf_counter() - model_load_start:.2f}s")
+    model = _maybe_place_model(
+        model,
+        requested_device_map=device_map,
+        requested_dtype=torch_dtype,
+    )
+    model.eval()
+    _debug_log(debug_logging, "model switched to eval mode")
+
+    head_filter_start = perf_counter()
+    sampled_query_heads, sampled_key_heads, explicit_heads, head_sampling_metadata = resolve_head_filters(
+        model=model,
+        capture_settings=config.capture,
+    )
+    _debug_log(debug_logging, f"head filters resolved in {perf_counter() - head_filter_start:.2f}s")
+
+    sampler_factory = build_sampler_factory(config.capture.sampler, min_bucket_size=config.capture.min_bucket_size)
+    metadata: Dict[str, Union[str, int, float]] = {
+        "source_dataset": config.dataset.path,
+        "dataset_name": config.dataset.name or "",
+        "dataset_split": config.dataset.split,
+        "attention_scope": "full_only" if config.capture.full_attention_only else "all_attention",
+        "dataset_repo": config.output.hf_repo_id or "",
+        "dataset_branch": config.output.hf_branch or "",
+    }
+    metadata.update(head_sampling_metadata)
+    sniffer_config = SnifferConfig(
+        model_name=config.model.name,
+        data_root=config.output.data_root,
+        readme_path=readme_path,
+        capture_queries=config.capture.capture_queries,
+        capture_keys=config.capture.capture_keys,
+        layers=set(config.capture.layers) if config.capture.layers else None,
+        heads=explicit_heads,
+        sampled_query_heads=sampled_query_heads,
+        sampled_key_heads=sampled_key_heads,
+        sampler_factory=sampler_factory,
+        max_rows_per_batch=config.capture.max_rows_per_batch,
+        queue_size=config.capture.queue_size,
+        write_batch_size=config.output.write_batch_size,
+        min_bucket_size=config.capture.min_bucket_size,
+        capture_pre_rope=config.capture.capture_pre_rope,
+        capture_token_strings=config.capture.capture_token_strings,
+        full_attention_only=config.capture.full_attention_only,
+        metadata=metadata,
+        debug_logging=debug_logging,
+    )
+
+    primary_device = resolve_primary_device(model)
+    autocast_dtype = resolve_dtype(config.inference.autocast_dtype)
+    print("Model device:", primary_device)
+    _debug_log(debug_logging, f"autocast dtype={autocast_dtype}")
+
+    total_rows = _estimate_total_rows(dataset, dataset_settings=config.dataset)
+    _debug_log(debug_logging, f"progress target rows={total_rows}")
+    progress = tqdm(total=total_rows, desc="Capturing", unit="rows")
+    batch_idx = 0
+    mps_cleanup_every = max(0, int(config.inference.mps_cleanup_every_batches))
     try:
-        if distributed.enabled:
-            dist_work_root = _distributed_work_root(final_data_root)
-            if distributed.is_main:
-                if dist_work_root.exists():
-                    shutil.rmtree(dist_work_root)
-                dist_work_root.mkdir(parents=True, exist_ok=True)
-            _distributed_barrier(distributed)
-            rank_root = dist_work_root / f"rank{distributed.rank:05d}"
-            rank_root.mkdir(parents=True, exist_ok=True)
-            rank_output_settings = _rank_output_settings(final_output_settings, rank_root)
-
-            if distributed.is_main:
-                pull_remote_dataset(final_output_settings)
-            _distributed_barrier(distributed)
-        else:
-            pull_remote_dataset(final_output_settings)
-            final_data_root.mkdir(parents=True, exist_ok=True)
-
-        dataset_load_start = perf_counter()
-        dataset = load_hf_dataset(config.dataset)
-        _debug_log(
-            debug_logging,
-            (
-                f"dataset loaded in {perf_counter() - dataset_load_start:.2f}s: "
-                f"path={config.dataset.path}, split={config.dataset.split}, streaming={config.dataset.streaming}"
-            ),
-        )
-        if distributed.world_size > 1:
-            dataset = _shard_dataset_for_rank(
-                dataset,
-                rank=distributed.rank,
-                world_size=distributed.world_size,
-            )
-
-        tokenizer_load_start = perf_counter()
-        tokenizer = prepare_tokenizer(config.tokenizer, config.model.name)
-        _debug_log(debug_logging, f"tokenizer prepared in {perf_counter() - tokenizer_load_start:.2f}s")
-        readme_path = resolve_readme_path(rank_output_settings)
-
-        torch_dtype = resolve_dtype(config.model.dtype)
-        model_config = prepare_model_config(config.model)
-        device_map = config.model.device_map
-        if distributed.enabled and torch.cuda.is_available():
-            device_map = {"": distributed.local_rank}
-        elif distributed.enabled:
-            device_map = None
-        device_map = _normalize_device_map_for_runtime(device_map, distributed=distributed)
-
-        resolved_attn = _resolve_attn_implementation(config.model.attn_implementation)
-        if resolved_attn and resolved_attn != config.model.attn_implementation:
-            config.model.attn_implementation = resolved_attn
-        _debug_log(
-            debug_logging,
-            f"loading model: dtype={torch_dtype}, device_map={device_map!r}, attn={config.model.attn_implementation!r}",
-        )
-        model_load_start = perf_counter()
-        model = _load_model_from_pretrained(
-            settings=config.model,
-            model_config=model_config,
-            torch_dtype=torch_dtype,
-            device_map=device_map,
-        )
-        _debug_log(debug_logging, f"model loaded in {perf_counter() - model_load_start:.2f}s")
-        model = _maybe_place_single_process_model(
-            model,
-            distributed=distributed,
-            requested_device_map=device_map,
-            requested_dtype=torch_dtype,
-        )
-        model.eval()
-        _debug_log(debug_logging, "model switched to eval mode")
-
-        head_filter_start = perf_counter()
-        sampled_query_heads, sampled_key_heads, explicit_heads, head_sampling_metadata = resolve_head_filters(
-            model=model,
-            capture_settings=config.capture,
-        )
-        _debug_log(debug_logging, f"head filters resolved in {perf_counter() - head_filter_start:.2f}s")
-
-        sampler_factory = build_sampler_factory(config.capture.sampler, min_bucket_size=config.capture.min_bucket_size)
-        metadata: Dict[str, Union[str, int, float]] = {
-            "source_dataset": config.dataset.path,
-            "dataset_name": config.dataset.name or "",
-            "dataset_split": config.dataset.split,
-            "attention_scope": "full_only" if config.capture.full_attention_only else "all_attention",
-            "distributed_world_size": distributed.world_size,
-            "dataset_repo": config.output.hf_repo_id or "",
-            "dataset_branch": config.output.hf_branch or "",
-        }
-        metadata.update(head_sampling_metadata)
-        sniffer_config = SnifferConfig(
-            model_name=config.model.name,
-            data_root=rank_output_settings.data_root,
-            readme_path=readme_path,
-            capture_queries=config.capture.capture_queries,
-            capture_keys=config.capture.capture_keys,
-            layers=set(config.capture.layers) if config.capture.layers else None,
-            heads=explicit_heads,
-            sampled_query_heads=sampled_query_heads,
-            sampled_key_heads=sampled_key_heads,
-            sampler_factory=sampler_factory,
-            max_rows_per_batch=config.capture.max_rows_per_batch,
-            queue_size=config.capture.queue_size,
-            write_batch_size=rank_output_settings.write_batch_size,
-            min_bucket_size=config.capture.min_bucket_size,
-            capture_pre_rope=config.capture.capture_pre_rope,
-            capture_token_strings=config.capture.capture_token_strings,
-            full_attention_only=config.capture.full_attention_only,
-            metadata=metadata,
-            debug_logging=debug_logging,
-        )
-
-        if distributed.enabled and torch.cuda.is_available():
-            primary_device = torch.device(f"cuda:{distributed.local_rank}")
-        else:
-            primary_device = resolve_primary_device(model)
-        autocast_dtype = resolve_dtype(config.inference.autocast_dtype)
-        print("Model device:", primary_device)
-        _debug_log(debug_logging, f"autocast dtype={autocast_dtype}")
-
-        total_rows = _estimate_total_rows(
-            dataset,
-            dataset_settings=config.dataset,
-            distributed=distributed,
-        )
-        _debug_log(debug_logging, f"progress target rows={total_rows}")
-        progress = tqdm(
-            total=total_rows,
-            desc="Capturing",
-            unit="rows",
-            disable=bool(distributed.enabled and not distributed.is_main),
-        )
-        local_example_index = 0
-        batch_idx = 0
-        mps_cleanup_every = max(0, int(config.inference.mps_cleanup_every_batches))
-        try:
-            with activate_sniffer(sniffer_config) as active_sniffer:
-                flush_batch = getattr(active_sniffer, "flush_batch", None)
-                consume_debug_stats = getattr(active_sniffer, "consume_debug_stats", None)
-                for batch in batch_iter(dataset, config.dataset, config.inference.batch_size):
-                    batch_idx += 1
-                    texts: Sequence[str] = batch["texts"]
-                    if not texts:
-                        continue
-                    debug_this_batch = debug_logging and (
-                        batch_idx <= 3 or batch_idx % debug_log_every_n_batches == 0
+        with activate_sniffer(sniffer_config) as active_sniffer:
+            flush_batch = getattr(active_sniffer, "flush_batch", None)
+            consume_debug_stats = getattr(active_sniffer, "consume_debug_stats", None)
+            for batch in batch_iter(dataset, config.dataset, config.inference.batch_size):
+                batch_idx += 1
+                texts: Sequence[str] = batch["texts"]
+                if not texts:
+                    continue
+                debug_this_batch = debug_logging and (
+                    batch_idx <= 3 or batch_idx % debug_log_every_n_batches == 0
+                )
+                batch_start = perf_counter()
+                if debug_this_batch:
+                    text_lengths = [len(text) for text in texts]
+                    avg_chars = sum(text_lengths) / len(text_lengths)
+                    _debug_log(
+                        True,
+                        (
+                            f"batch {batch_idx} start: rows={len(texts)}, "
+                            f"text_chars(min/avg/max)="
+                            f"{min(text_lengths)}/{avg_chars:.1f}/{max(text_lengths)}"
+                        ),
                     )
-                    batch_start = perf_counter()
-                    if debug_this_batch:
-                        text_lengths = [len(text) for text in texts]
-                        avg_chars = sum(text_lengths) / len(text_lengths)
-                        _debug_log(
-                            True,
-                            (
-                                f"batch {batch_idx} start: rows={len(texts)}, "
-                                f"text_chars(min/avg/max)="
-                                f"{min(text_lengths)}/{avg_chars:.1f}/{max(text_lengths)}"
-                            ),
-                        )
-                        _debug_log(True, f"batch {batch_idx}: tokenizer start")
-                    tokenize_start = perf_counter()
-                    encodings = tokenizer(
-                        list(texts),
-                        return_tensors="pt",
-                        padding=config.tokenizer.padding,
-                        truncation=True,
-                        max_length=config.tokenizer.max_length,
+                    _debug_log(True, f"batch {batch_idx}: tokenizer start")
+                tokenize_start = perf_counter()
+                encodings = tokenizer(
+                    list(texts),
+                    return_tensors="pt",
+                    padding=config.tokenizer.padding,
+                    truncation=True,
+                    max_length=config.tokenizer.max_length,
+                )
+                if debug_this_batch:
+                    tokenized_in = perf_counter() - tokenize_start
+                    input_ids = encodings.get("input_ids")
+                    seq_len = int(input_ids.shape[-1]) if input_ids is not None else None
+                    _debug_log(
+                        True,
+                        (
+                            f"batch {batch_idx}: tokenizer done in {tokenized_in:.3f}s, "
+                            f"seq_len={seq_len}, tensors=({_summarize_tensor_shapes(encodings)})"
+                        ),
                     )
-                    if debug_this_batch:
-                        tokenized_in = perf_counter() - tokenize_start
-                        input_ids = encodings.get("input_ids")
-                        seq_len = int(input_ids.shape[-1]) if input_ids is not None else None
-                        _debug_log(
-                            True,
-                            (
-                                f"batch {batch_idx}: tokenizer done in {tokenized_in:.3f}s, "
-                                f"seq_len={seq_len}, tensors=({_summarize_tensor_shapes(encodings)})"
-                            ),
-                        )
-                    batch_example_ids = batch["example_ids"]
-                    if distributed.world_size > 1 and config.dataset.id_column is None:
-                        count = len(batch_example_ids)
-                        batch_example_ids = [
-                            (local_example_index + idx) * distributed.world_size + distributed.rank
-                            for idx in range(count)
-                        ]
-                        local_example_index += count
-                    if config.capture.capture_token_strings:
-                        input_ids = encodings.get("input_ids")
-                        if input_ids is None:
-                            raise ValueError("Tokenizer did not return input_ids required for token string capture.")
-                        token_id_rows = input_ids.tolist()
-                        token_strings = [
-                            tokenizer.convert_ids_to_tokens(row, skip_special_tokens=False) for row in token_id_rows
-                        ]
-                        set_active_token_strings(token_strings)
-                    attention_mask = encodings.get("attention_mask")
-                    if attention_mask is not None:
-                        valid_lengths = attention_mask.sum(dim=1).tolist()
-                    else:
-                        seq_len = next(iter(encodings.values())).shape[-1]
-                        valid_lengths = [seq_len] * len(texts)
-                    set_active_example_ids(batch_example_ids)
-                    set_active_sequence_lengths([int(length) for length in valid_lengths])
-                    if debug_this_batch:
-                        valid_min = min(valid_lengths)
-                        valid_max = max(valid_lengths)
-                        _debug_log(True, f"batch {batch_idx}: valid token lengths min/max={valid_min}/{valid_max}")
-                        _debug_log(True, f"batch {batch_idx}: moving tensors to device {primary_device}")
-                    move_start = perf_counter()
-                    inputs = {k: v.to(primary_device) for k, v in encodings.items()}
-                    if debug_this_batch:
-                        _debug_log(
-                            True,
-                            (
-                                f"batch {batch_idx}: device transfer done in {perf_counter() - move_start:.3f}s, "
-                                f"tensors=({_summarize_tensor_shapes(inputs)})"
-                            ),
-                        )
-                        _debug_log(True, f"batch {batch_idx}: forward start")
-                    forward_start = perf_counter()
-                    with torch.no_grad():
-                        use_autocast = primary_device.type == "cuda"
-                        context = (
-                            torch.autocast(device_type=primary_device.type, dtype=autocast_dtype)
-                            if use_autocast
-                            else nullcontext()
-                        )
-                        with context:
-                            backbone = getattr(model, "model", None)
-                            if isinstance(backbone, torch.nn.Module):
-                                backbone(**inputs)
-                            else:
-                                model(**inputs)
-                    if callable(flush_batch):
-                        flush_batch()
-                    if debug_this_batch:
-                        if callable(consume_debug_stats):
-                            stats = consume_debug_stats()
+                batch_example_ids = batch["example_ids"]
+                if config.capture.capture_token_strings:
+                    input_ids = encodings.get("input_ids")
+                    if input_ids is None:
+                        raise ValueError("Tokenizer did not return input_ids required for token string capture.")
+                    token_id_rows = input_ids.tolist()
+                    token_strings = [
+                        tokenizer.convert_ids_to_tokens(row, skip_special_tokens=False) for row in token_id_rows
+                    ]
+                    set_active_token_strings(token_strings)
+                attention_mask = encodings.get("attention_mask")
+                if attention_mask is not None:
+                    valid_lengths = attention_mask.sum(dim=1).tolist()
+                else:
+                    seq_len = next(iter(encodings.values())).shape[-1]
+                    valid_lengths = [seq_len] * len(texts)
+                set_active_example_ids(batch_example_ids)
+                set_active_sequence_lengths([int(length) for length in valid_lengths])
+                if debug_this_batch:
+                    valid_min = min(valid_lengths)
+                    valid_max = max(valid_lengths)
+                    _debug_log(True, f"batch {batch_idx}: valid token lengths min/max={valid_min}/{valid_max}")
+                    _debug_log(True, f"batch {batch_idx}: moving tensors to device {primary_device}")
+                move_start = perf_counter()
+                inputs = {k: v.to(primary_device) for k, v in encodings.items()}
+                if debug_this_batch:
+                    _debug_log(
+                        True,
+                        (
+                            f"batch {batch_idx}: device transfer done in {perf_counter() - move_start:.3f}s, "
+                            f"tensors=({_summarize_tensor_shapes(inputs)})"
+                        ),
+                    )
+                    _debug_log(True, f"batch {batch_idx}: forward start")
+                forward_start = perf_counter()
+                with torch.no_grad():
+                    use_autocast = primary_device.type == "cuda"
+                    context = (
+                        torch.autocast(device_type=primary_device.type, dtype=autocast_dtype)
+                        if use_autocast
+                        else nullcontext()
+                    )
+                    with context:
+                        backbone = getattr(model, "model", None)
+                        if isinstance(backbone, torch.nn.Module):
+                            backbone(**inputs, use_cache=False)
                         else:
-                            stats = {
-                                "capture_invocations": 0,
-                                "capture_time_s": 0.0,
-                                "flush_invocations": 0,
-                                "flush_time_s": 0.0,
-                                "captured_payloads": 0,
-                                "captured_rows": 0,
-                                "submit_wait_s": 0.0,
-                                "pending_configs": 0,
-                                "writer_batches_total": 0,
-                                "writer_rows_total": 0,
-                                "writer_queue_depth": 0,
-                            }
-                        _debug_log(
-                            True,
-                            f"batch {batch_idx}: forward done in {perf_counter() - forward_start:.3f}s",
-                        )
-                        _debug_log(
-                            True,
-                            (
-                                f"batch {batch_idx}: capture stats "
-                                f"(hook_calls={int(stats['capture_invocations'])}, "
-                                f"hook_s={float(stats['capture_time_s']):.3f}, "
-                                f"flush_calls={int(stats['flush_invocations'])}, "
-                                f"flush_s={float(stats['flush_time_s']):.3f}, "
-                                f"payloads={int(stats['captured_payloads'])}, "
-                                f"rows={int(stats['captured_rows'])}, "
-                                f"queue_wait_s={float(stats['submit_wait_s']):.3f}, "
-                                f"pending_configs={int(stats['pending_configs'])}, "
-                                f"writer_total_batches={int(stats['writer_batches_total'])}, "
-                                f"writer_total_rows={int(stats['writer_rows_total'])}, "
-                                f"writer_queue={int(stats['writer_queue_depth'])})"
-                            ),
-                        )
-                    progress.update(len(texts))
-                    if primary_device.type == "mps" and mps_cleanup_every > 0 and batch_idx % mps_cleanup_every == 0:
-                        cleanup_start = perf_counter()
-                        gc.collect()
-                        mps_backend = getattr(torch, "mps", None)
-                        if mps_backend is not None and hasattr(mps_backend, "empty_cache"):
-                            mps_backend.empty_cache()
-                        if debug_this_batch:
-                            _debug_log(
-                                True,
-                                f"batch {batch_idx}: mps cleanup in {perf_counter() - cleanup_start:.3f}s",
-                            )
+                            model(**inputs, use_cache=False)
+                if callable(flush_batch):
+                    flush_batch()
+                if debug_this_batch:
+                    if callable(consume_debug_stats):
+                        stats = consume_debug_stats()
+                    else:
+                        stats = {
+                            "capture_invocations": 0,
+                            "capture_time_s": 0.0,
+                            "flush_invocations": 0,
+                            "flush_time_s": 0.0,
+                            "captured_payloads": 0,
+                            "captured_rows": 0,
+                            "submit_wait_s": 0.0,
+                            "pending_configs": 0,
+                            "writer_batches_total": 0,
+                            "writer_rows_total": 0,
+                            "writer_queue_depth": 0,
+                        }
+                    _debug_log(
+                        True,
+                        f"batch {batch_idx}: forward done in {perf_counter() - forward_start:.3f}s",
+                    )
+                    _debug_log(
+                        True,
+                        (
+                            f"batch {batch_idx}: capture stats "
+                            f"(hook_calls={int(stats['capture_invocations'])}, "
+                            f"hook_s={float(stats['capture_time_s']):.3f}, "
+                            f"flush_calls={int(stats['flush_invocations'])}, "
+                            f"flush_s={float(stats['flush_time_s']):.3f}, "
+                            f"payloads={int(stats['captured_payloads'])}, "
+                            f"rows={int(stats['captured_rows'])}, "
+                            f"queue_wait_s={float(stats['submit_wait_s']):.3f}, "
+                            f"pending_configs={int(stats['pending_configs'])}, "
+                            f"writer_total_batches={int(stats['writer_batches_total'])}, "
+                            f"writer_total_rows={int(stats['writer_rows_total'])}, "
+                            f"writer_queue={int(stats['writer_queue_depth'])})"
+                        ),
+                    )
+                progress.update(len(texts))
+                if primary_device.type == "mps" and mps_cleanup_every > 0 and batch_idx % mps_cleanup_every == 0:
+                    cleanup_start = perf_counter()
+                    gc.collect()
+                    mps_backend = getattr(torch, "mps", None)
+                    if mps_backend is not None and hasattr(mps_backend, "empty_cache"):
+                        mps_backend.empty_cache()
                     if debug_this_batch:
                         _debug_log(
                             True,
-                            f"batch {batch_idx} done in {perf_counter() - batch_start:.3f}s",
+                            f"batch {batch_idx}: mps cleanup in {perf_counter() - cleanup_start:.3f}s",
                         )
-        finally:
-            progress.close()
-
-        if distributed.enabled:
-            _distributed_barrier(distributed)
-            if distributed.is_main:
-                if dist_work_root is None:
-                    raise RuntimeError("Distributed work root is not initialized.")
-                rank_roots = [path for path in sorted(dist_work_root.iterdir()) if path.is_dir()]
-                merge_rank_outputs(rank_roots, final_output_settings)
-            _distributed_barrier(distributed)
-            if distributed.is_main:
-                push_remote_dataset(final_output_settings)
-            _distributed_barrier(distributed)
-            if distributed.is_main and dist_work_root is not None:
-                shutil.rmtree(dist_work_root, ignore_errors=True)
-            _distributed_barrier(distributed)
-        else:
-            push_remote_dataset(final_output_settings)
+                if debug_this_batch:
+                    _debug_log(
+                        True,
+                        f"batch {batch_idx} done in {perf_counter() - batch_start:.3f}s",
+                    )
     finally:
-        _destroy_distributed_context(distributed)
+        progress.close()
+
+    push_remote_dataset(config.output)
 
 
 def main():
