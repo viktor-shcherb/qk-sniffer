@@ -230,6 +230,53 @@ class DatasetSaver:
 
         self._append_pending(key, columns)
 
+    def write_config_data(
+        self,
+        config_name: str,
+        *,
+        vectors: "np.ndarray",
+        buckets: "np.ndarray",
+        example_ids: "np.ndarray",
+        positions: "np.ndarray",
+        sliding_window: Optional[int],
+        token_strings: Optional[Sequence[str]] = None,
+    ) -> None:
+        """Write a complete config's data to parquet in one shot."""
+        if np is None:
+            raise RuntimeError("NumPy is required.")
+        n = vectors.shape[0]
+        if n == 0:
+            return
+        self._config_names.add(config_name)
+
+        buckets_i32 = buckets.astype("int32", copy=False)
+        example_ids_i32 = example_ids.astype("int32", copy=False)
+        positions_i32 = positions.astype("int32", copy=False)
+        vectors_f32 = vectors.astype("float32", copy=False)
+
+        list_size = vectors_f32.shape[1]
+        flat_values = pa.array(vectors_f32.reshape(-1), type=pa.float32())
+        vector_array = pa.FixedSizeListArray.from_arrays(flat_values, list_size)
+
+        sw_values = [int(sliding_window)] * n if sliding_window is not None else [None] * n
+        data = {
+            "bucket": pa.array(buckets_i32, type=pa.int32()),
+            "example_id": pa.array(example_ids_i32, type=pa.int32()),
+            "position": pa.array(positions_i32, type=pa.int32()),
+            "vector": vector_array,
+            "sliding_window": pa.array(sw_values),
+        }
+        if token_strings is not None:
+            data["token_str"] = pa.array(token_strings, type=pa.string())
+
+        table = pa.table(data)
+        sink = self._sinks.setdefault(config_name, self._create_sink(config_name))
+        sink.write(table)
+
+        unique_buckets, counts = np.unique(buckets_i32, return_counts=True)
+        for b, c in zip(unique_buckets.tolist(), counts.tolist()):
+            self._bucket_counts[int(b)] += int(c)
+
     def _append_pending(self, key: str, columns: Dict[str, List]) -> None:
         pending = self._pending.setdefault(key, self._empty_pending())
         for name, values in columns.items():

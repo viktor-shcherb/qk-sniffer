@@ -3,16 +3,14 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import math
-from queue import Full, Queue
-from threading import Thread
 from pathlib import Path
 from time import perf_counter
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union, Literal
+from typing import Callable, Dict, List, Optional, Sequence, Set, Union, Literal
 
 import numpy as np
 import torch
 
-from saver.dataset import CaptureBatch, DatasetSaver
+from saver.dataset import DatasetSaver
 from .samplers import LogUniformSampler, UniformSampler, Sampler
 
 
@@ -34,7 +32,6 @@ class SnifferConfig:
     sampled_key_heads: Optional[Dict[int, Set[int]]] = None
     metadata: Dict[str, Union[str, int, float]] = field(default_factory=dict)
     sampler_factory: Optional[Callable[[], Sampler]] = None
-    queue_size: int = 32
     max_rows_per_batch: Optional[int] = None
     write_batch_size: int = 4096
     min_bucket_size: int = 128
@@ -57,6 +54,20 @@ class _PendingCapture:
     token_strings: Optional[List[str]] = None
 
 
+@dataclass(slots=True)
+class _AccumulatedCapture:
+    layer_idx: int
+    head_idx: int
+    vector_kind: Literal["q", "k"]
+    sliding_window: Optional[int]
+    vectors: List[np.ndarray] = field(default_factory=list)
+    buckets: List[np.ndarray] = field(default_factory=list)
+    example_ids: List[np.ndarray] = field(default_factory=list)
+    positions: List[np.ndarray] = field(default_factory=list)
+    token_strings: Optional[List[str]] = None
+    total_rows: int = 0
+
+
 def _synchronize_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -70,7 +81,6 @@ def _synchronize_device(device: torch.device) -> None:
 class Sniffer:
     def __init__(self, config: SnifferConfig):
         self.config = config
-        queue_size = max(1, int(config.queue_size))
         self.saver = DatasetSaver(
             root=config.data_root,
             readme_path=config.readme_path,
@@ -104,11 +114,7 @@ class Sniffer:
             metadata.setdefault("sampling_bucket_size", self._uniform_bucket_size)
         metadata.setdefault("sampling_strategy", "all" if self._bucket_kind == "all" else self._bucket_kind)
         self.saver.register_model_metadata(self.config.model_name, metadata)
-        self._writer = _CaptureWorker(
-            self.saver,
-            queue_size=queue_size,
-            debug_logging=bool(config.debug_logging),
-        )
+        self._accumulated: Dict[str, _AccumulatedCapture] = {}
         self._max_rows_per_batch: Optional[int] = (
             int(config.max_rows_per_batch) if config.max_rows_per_batch and config.max_rows_per_batch > 0 else None
         )
@@ -119,7 +125,6 @@ class Sniffer:
         self._flush_time_s = 0.0
         self._captured_payloads = 0
         self._captured_rows = 0
-        self._submit_wait_s = 0.0
 
     def capture(
         self,
@@ -187,7 +192,23 @@ class Sniffer:
 
     def close(self) -> None:
         self.flush_batch()
-        self._writer.close()
+        for key, acc in self._accumulated.items():
+            if acc.total_rows == 0:
+                continue
+            vectors = np.concatenate(acc.vectors) if len(acc.vectors) > 1 else acc.vectors[0]
+            buckets = np.concatenate(acc.buckets) if len(acc.buckets) > 1 else acc.buckets[0]
+            example_ids = np.concatenate(acc.example_ids) if len(acc.example_ids) > 1 else acc.example_ids[0]
+            positions = np.concatenate(acc.positions) if len(acc.positions) > 1 else acc.positions[0]
+            self.saver.write_config_data(
+                key,
+                vectors=vectors,
+                buckets=buckets,
+                example_ids=example_ids,
+                positions=positions,
+                sliding_window=acc.sliding_window,
+                token_strings=acc.token_strings,
+            )
+        self._accumulated.clear()
         self.saver.close()
 
     def __enter__(self) -> "Sniffer":
@@ -407,7 +428,7 @@ class Sniffer:
             positions_np = positions.detach().to(device="cpu", dtype=torch.int64).contiguous().numpy()
             buckets_np = buckets.detach().to(device="cpu", dtype=torch.int64).contiguous().numpy()
 
-            # Split by head on CPU
+            # Split by head on CPU and accumulate dense numpy arrays
             unique_heads = np.unique(head_indices_np)
             for head_idx in unique_heads:
                 mask = head_indices_np == int(head_idx)
@@ -415,26 +436,27 @@ class Sniffer:
                 row_count = h_vectors.shape[0]
                 if row_count == 0:
                     continue
-                h_token_strings: Optional[List[str]] = None
-                if pending.token_strings is not None:
+                config_key = f"l{pending.layer_idx:02d}h{int(head_idx):02d}{pending.vector_kind}"
+                acc = self._accumulated.get(config_key)
+                if acc is None:
+                    acc = _AccumulatedCapture(
+                        layer_idx=pending.layer_idx,
+                        head_idx=int(head_idx),
+                        vector_kind=pending.vector_kind,
+                        sliding_window=pending.sliding_window,
+                        token_strings=[] if pending.token_strings is not None else None,
+                    )
+                    self._accumulated[config_key] = acc
+                acc.vectors.append(h_vectors)
+                acc.buckets.append(buckets_np[mask])
+                acc.example_ids.append(example_ids_np[mask])
+                acc.positions.append(positions_np[mask])
+                if pending.token_strings is not None and acc.token_strings is not None:
                     indices = np.where(mask)[0]
-                    h_token_strings = [pending.token_strings[i] for i in indices]
-                batch_payload = CaptureBatch(
-                    model_name=self.config.model_name,
-                    layer_idx=pending.layer_idx,
-                    head_idx=int(head_idx),
-                    vector_kind=pending.vector_kind,
-                    buckets=buckets_np[mask],
-                    example_ids=example_ids_np[mask],
-                    positions=positions_np[mask],
-                    vectors=h_vectors,
-                    sliding_window=pending.sliding_window,
-                    token_strings=h_token_strings,
-                )
-                submit_wait_s = self._writer.submit(batch_payload)
+                    acc.token_strings.extend(pending.token_strings[i] for i in indices)
+                acc.total_rows += row_count
                 self._captured_payloads += 1
                 self._captured_rows += row_count
-                self._submit_wait_s += submit_wait_s
         self._pending_captures.clear()
         self._flush_invocations += 1
         self._flush_time_s += perf_counter() - flush_start
@@ -518,7 +540,6 @@ class Sniffer:
         return prepared
 
     def consume_debug_stats(self) -> Dict[str, Union[int, float]]:
-        writer_batches, writer_rows, queue_depth = self._writer.stats_snapshot()
         snapshot: Dict[str, Union[int, float]] = {
             "capture_invocations": self._capture_invocations,
             "capture_time_s": self._capture_time_s,
@@ -526,11 +547,8 @@ class Sniffer:
             "flush_time_s": self._flush_time_s,
             "captured_payloads": self._captured_payloads,
             "captured_rows": self._captured_rows,
-            "submit_wait_s": self._submit_wait_s,
             "pending_configs": len(self._pending_captures),
-            "writer_batches_total": writer_batches,
-            "writer_rows_total": writer_rows,
-            "writer_queue_depth": queue_depth,
+            "accumulated_configs": len(self._accumulated),
         }
         self._capture_invocations = 0
         self._capture_time_s = 0.0
@@ -538,100 +556,7 @@ class Sniffer:
         self._flush_time_s = 0.0
         self._captured_payloads = 0
         self._captured_rows = 0
-        self._submit_wait_s = 0.0
         return snapshot
-
-
-_CAPTURE_SENTINEL: object = object()
-
-
-class _CaptureWorker:
-    def __init__(self, saver: DatasetSaver, queue_size: int, *, debug_logging: bool = False):
-        self._saver = saver
-        self._queue: "Queue[Optional[CaptureBatch]]" = Queue(maxsize=queue_size)
-        self._thread = Thread(target=self._run, daemon=True)
-        self._closed = False
-        self._exception: Optional[BaseException] = None
-        self._debug_logging = bool(debug_logging)
-        self._processed_batches = 0
-        self._processed_rows = 0
-        self._thread.start()
-
-    def submit(self, batch: CaptureBatch) -> float:
-        if batch.vectors.size == 0:
-            return 0.0
-        self._raise_if_failed()
-        if self._closed:
-            raise RuntimeError("Cannot submit captures after the worker is closed.")
-        put_start = perf_counter()
-        if not self._debug_logging:
-            self._queue.put(batch)
-            return perf_counter() - put_start
-        while True:
-            try:
-                self._queue.put(batch, timeout=5.0)
-                return perf_counter() - put_start
-            except Full:
-                self._raise_if_failed()
-                _debug_log(
-                    True,
-                    (
-                        "capture queue is full "
-                        f"({self._queue.qsize()}/{self._queue.maxsize}); waiting for writer thread."
-                    ),
-                )
-
-    def close(self) -> None:
-        if self._closed:
-            self._queue.join()
-            self._raise_if_failed()
-            return
-        _debug_log(self._debug_logging, "capture worker close requested")
-        self._queue.put(_CAPTURE_SENTINEL)
-        self._queue.join()
-        self._thread.join()
-        self._closed = True
-        _debug_log(
-            self._debug_logging,
-            f"capture worker closed: batches={self._processed_batches}, rows={self._processed_rows}",
-        )
-        self._raise_if_failed()
-
-    def _run(self) -> None:
-        while True:
-            item = self._queue.get()
-            if item is _CAPTURE_SENTINEL:
-                self._queue.task_done()
-                break
-            try:
-                if self._exception is None:
-                    write_start = perf_counter()
-                    self._saver.add_batch(item)
-                    self._processed_batches += 1
-                    self._processed_rows += int(item.vectors.shape[0])
-                    if self._debug_logging and (
-                        self._processed_batches <= 3 or self._processed_batches % 2000 == 0
-                    ):
-                        _debug_log(
-                            True,
-                            (
-                                f"writer processed batch {self._processed_batches} "
-                                f"(rows={item.vectors.shape[0]}, queue={self._queue.qsize()}, "
-                                f"write_s={perf_counter() - write_start:.3f})"
-                            ),
-                        )
-            except Exception as exc:  # pragma: no cover - propagated to main thread
-                if self._exception is None:
-                    self._exception = exc
-            finally:
-                self._queue.task_done()
-
-    def _raise_if_failed(self) -> None:
-        if self._exception is not None:
-            raise RuntimeError("Capture worker failed; see the chained exception.") from self._exception
-
-    def stats_snapshot(self) -> Tuple[int, int, int]:
-        return self._processed_batches, self._processed_rows, self._queue.qsize()
 
 
 _ACTIVE_SNIFFER: Optional[Sniffer] = None

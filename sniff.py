@@ -62,7 +62,6 @@ class CaptureSettings:
     full_attention_only: bool = False
     sampler: SamplerSettings = field(default_factory=SamplerSettings)
     max_rows_per_batch: Optional[int] = None
-    queue_size: int = 32
     min_bucket_size: int = 128
     capture_pre_rope: bool = False
     capture_token_strings: bool = False
@@ -1013,7 +1012,6 @@ def run_inference(config: SniffConfig) -> None:
         sampled_key_heads=sampled_key_heads,
         sampler_factory=sampler_factory,
         max_rows_per_batch=config.capture.max_rows_per_batch,
-        queue_size=config.capture.queue_size,
         write_batch_size=config.output.write_batch_size,
         min_bucket_size=config.capture.min_bucket_size,
         capture_pre_rope=config.capture.capture_pre_rope,
@@ -1143,11 +1141,8 @@ def run_inference(config: SniffConfig) -> None:
                             "flush_time_s": 0.0,
                             "captured_payloads": 0,
                             "captured_rows": 0,
-                            "submit_wait_s": 0.0,
                             "pending_configs": 0,
-                            "writer_batches_total": 0,
-                            "writer_rows_total": 0,
-                            "writer_queue_depth": 0,
+                            "accumulated_configs": 0,
                         }
                     _debug_log(
                         True,
@@ -1163,11 +1158,8 @@ def run_inference(config: SniffConfig) -> None:
                             f"flush_s={float(stats['flush_time_s']):.3f}, "
                             f"payloads={int(stats['captured_payloads'])}, "
                             f"rows={int(stats['captured_rows'])}, "
-                            f"queue_wait_s={float(stats['submit_wait_s']):.3f}, "
                             f"pending_configs={int(stats['pending_configs'])}, "
-                            f"writer_total_batches={int(stats['writer_batches_total'])}, "
-                            f"writer_total_rows={int(stats['writer_rows_total'])}, "
-                            f"writer_queue={int(stats['writer_queue_depth'])})"
+                            f"accumulated_configs={int(stats['accumulated_configs'])})"
                         ),
                     )
                 progress.update(len(texts))
