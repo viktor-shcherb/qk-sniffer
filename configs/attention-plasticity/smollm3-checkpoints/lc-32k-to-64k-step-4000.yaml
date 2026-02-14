@@ -14,7 +14,7 @@ model:
   trust_remote_code: false
 
 tokenizer:
-  name: HuggingFaceTB/SmolLM3-3B-checkpoints
+  name: HuggingFaceTB/SmolLM3-3B
   max_length: 65536
   padding: longest
 
