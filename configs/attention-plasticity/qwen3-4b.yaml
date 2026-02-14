@@ -45,4 +45,5 @@ capture:
 output:
   data_root: data/attention-plasticity
   readme_path: README.md
-  hf_repo_id: viktoroo/sniffed-qk-qwen3-4b-longbench-pro-128k-plus
+  hf_repo_id: viktoroo/sniffed-qk
+  hf_branch: qwen3-4b-longbench-pro-128k-plus

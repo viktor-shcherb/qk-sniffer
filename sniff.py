@@ -63,7 +63,7 @@ class CaptureSettings:
     full_attention_only: bool = False
     sampler: SamplerSettings = field(default_factory=SamplerSettings)
     max_rows_per_batch: Optional[int] = None
-    queue_size: int = 8
+    queue_size: int = 32
     min_bucket_size: int = 128
     capture_pre_rope: bool = False
     capture_token_strings: bool = False
@@ -117,7 +117,7 @@ class OutputSettings:
     hf_repo_id: Optional[str] = None
     hf_branch: Optional[str] = None
     private: bool = False
-    write_batch_size: int = 2048
+    write_batch_size: int = 4096
 
 
 @dataclass

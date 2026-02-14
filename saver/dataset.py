@@ -111,7 +111,7 @@ class DatasetSaver:
         compression: str = "zstd",
         readme_path: Union[str, Path] = "README.md",
         dataset_name: str = "viktoroo/sniffed-qk",
-        write_batch_size: int = 2048,
+        write_batch_size: int = 4096,
         mirror_readme_paths: Optional[Sequence[Union[str, Path]]] = None,
     ):
         self.root = Path(root)

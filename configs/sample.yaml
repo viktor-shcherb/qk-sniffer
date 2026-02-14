@@ -49,4 +49,3 @@ output:
   hf_repo_id: viktoroo/test-sniffer-qk
   hf_branch: smollm2-135m-longbench-pro-128k-plus
   private: false
-  write_batch_size: 2048

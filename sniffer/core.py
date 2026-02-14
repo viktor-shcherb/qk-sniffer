@@ -33,9 +33,9 @@ class SnifferConfig:
     sampled_key_heads: Optional[Dict[int, Set[int]]] = None
     metadata: Dict[str, Union[str, int, float]] = field(default_factory=dict)
     sampler_factory: Optional[Callable[[], Sampler]] = None
-    queue_size: int = 8
+    queue_size: int = 32
     max_rows_per_batch: Optional[int] = None
-    write_batch_size: int = 2048
+    write_batch_size: int = 4096
     min_bucket_size: int = 128
     capture_pre_rope: bool = False
     capture_token_strings: bool = False
