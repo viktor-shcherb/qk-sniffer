@@ -32,7 +32,7 @@ capture:
     seed: 0
   full_attention_only: true
   capture_pre_rope: false
-  min_bucket_size: 8192
+  min_bucket_size: 2048
   sampler:
     type: uniform
     base_rate: 1.0
