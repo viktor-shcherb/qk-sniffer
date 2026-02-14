@@ -990,16 +990,17 @@ def run_inference(config: SniffConfig) -> None:
     )
     _debug_log(debug_logging, f"head filters resolved in {perf_counter() - head_filter_start:.2f}s")
 
+    full_only_suffix = " (full-attention layers only)" if config.capture.full_attention_only else ""
     if sampled_query_heads is not None:
         n_sampled_q = sum(len(heads) for heads in sampled_query_heads.values())
-        print(f"[sniff] Sniffing {n_sampled_q} sampled query heads across {len(sampled_query_heads)} layers")
+        print(f"[sniff] Sniffing {n_sampled_q} sampled query heads across {len(sampled_query_heads)} layers{full_only_suffix}")
     else:
-        print("[sniff] Sniffing all query heads (no head sampling)")
+        print(f"[sniff] Sniffing all query heads (no head sampling){full_only_suffix}")
     if sampled_key_heads is not None:
         n_sampled_k = sum(len(heads) for heads in sampled_key_heads.values())
-        print(f"[sniff] Sniffing {n_sampled_k} sampled key heads across {len(sampled_key_heads)} layers")
+        print(f"[sniff] Sniffing {n_sampled_k} sampled key heads across {len(sampled_key_heads)} layers{full_only_suffix}")
     else:
-        print("[sniff] Sniffing all key heads (no head sampling)")
+        print(f"[sniff] Sniffing all key heads (no head sampling){full_only_suffix}")
 
     sampler_factory = build_sampler_factory(config.capture.sampler, min_bucket_size=config.capture.min_bucket_size)
     metadata: Dict[str, Union[str, int, float]] = {

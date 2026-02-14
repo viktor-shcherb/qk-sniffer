@@ -1,0 +1,44 @@
+dataset:
+  path: viktoroo/longbench-pro-128k-plus
+  name: null
+  split: test
+  text_column: text
+  id_column: id
+  max_samples: null
+
+model:
+  name: HuggingFaceTB/SmolLM3-3B-checkpoints
+  revision: lc-4k-to-32k-step-20000
+  dtype: bfloat16
+  device_map: auto
+  trust_remote_code: false
+
+tokenizer:
+  name: HuggingFaceTB/SmolLM3-3B-checkpoints
+  max_length: 32768
+  padding: longest
+
+inference:
+  batch_size: 1
+  autocast_dtype: bfloat16
+
+capture:
+  capture_queries: true
+  capture_keys: true
+  layers: null
+  heads: null
+  head_sampling:
+    count: 300
+    seed: 0
+  full_attention_only: true
+  capture_pre_rope: false
+  min_bucket_size: 8192
+  sampler:
+    type: uniform
+    base_rate: 1.0
+
+output:
+  data_root: data/attention-plasticity
+  readme_path: README.md
+  hf_repo_id: viktoroo/sniffed-qk
+  hf_branch: smollm3-3b-lc-4k-to-32k-step-20000-longbench-pro-128k-plus
