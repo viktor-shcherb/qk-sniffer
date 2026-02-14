@@ -1,113 +1,86 @@
 # qk-sniffer
 
-`qk-sniffer` instruments Hugging Face transformer models so each attention layer can stream sampled key/query vectors into Parquet shards that mirror Hugging Face dataset repos. It ships with Gemma 3/Llama/Mllama/Mistral 3+Ministral/Qwen 3 hooks, a deterministic sampler, and a CLI (`sniff-qk`) that can pull/push full datasets from the Hub.
+Capture sampled Q/K attention vectors from Hugging Face transformer models into Parquet datasets, one branch per model. Hooks are provided for Gemma 3, GLM, GLM4, Llama, Mllama, Ministral, Qwen 2, and Qwen 3.
 
-## Requirements & Installation
-- Python 3.9+, recent PyTorch build matching your hardware.
-- (Optional) create and activate a virtualenv.
-- Install in editable mode so `models/` is importable:
-  ```bash
-  pip install --upgrade pip
-  pip install -e .
-  ```
-- Put secrets (e.g., `HF_TOKEN`) in a `.env`; `python-dotenv` loads them automatically.
+## Setup
 
-## Quick Start
-1. **Instrument the model (if needed).** Copy the relevant `transformers` module into `models/<name>/modeling_<name>.py`, import `get_active_sniffer`/`compute_positions`, and call `sniffer.capture(...)` inside the attention block. Gemma 3, Llama, Mllama, Mistral 3+Ministral, and Qwen 3 are already wired up.
-2. **Create a config** (adapt the sample below):
-   ```yaml
-   dataset:
-     path: viktoroo/example
-     split: train
-     text_column: text
-   model:
-     name: google/gemma-2-2b
-     dtype: float16
-   tokenizer:
-     name: google/gemma-2-2b
-     max_length: 4096
-   inference:
-     batch_size: 2
-     autocast_dtype: float16
-     distributed: false        # true when launching via torchrun
-     backend: auto             # auto | nccl | gloo
-   capture:
-     capture_queries: true
-     capture_keys: true
-     full_attention_only: false # true => skip sliding/window-attention layers
-     min_bucket_size: 128
-     head_sampling:
-       count: 300             # sample query heads across all selected layers
-       seed: 0
-     sampler:
-       type: log_uniform       # log_uniform | uniform | all
-       base_rate: 1.0
-     capture_pre_rope: false
-     capture_token_strings: false
-   output:
-     data_root: data/sniffed-qk
-     readme_path: README.md
-     hf_repo_id: viktoroo/sniffed-qk
-   ```
-3. **Run the CLI**:
-   ```bash
-   sniff-qk --config configs/sample_sniff.yaml
-   # or
-   PYTHONPATH=. python sniff.py --config configs/sample_sniff.yaml
-   ```
-   The CLI patches local modeling files into `transformers`, downloads the latest dataset snapshot (if `hf_repo_id` is set), runs inference, writes captures directly into that synced copy, then uploads the result.
+```bash
+pip install -e .
+```
 
-## Key Configuration Notes
-- `dataset.*` maps directly to `datasets.load_dataset`. Set `max_samples` for dry runs. Use `streaming: true` to stream without downloading the full split; when streaming, `max_samples` stops after the first *N* examples. In distributed runs, `max_samples` is treated as a global cap across all ranks (the dataset is capped first, then sharded).
-- `model.*`/`tokenizer.*` feed `AutoModelForCausalLM` and `AutoTokenizer`. For single-process runs, `device_map=auto` works well for model sharding. In distributed (`torchrun`) mode, each rank loads the model on its local GPU.
-- `inference.*`
-  - `distributed=true` enables rank-aware execution (expects `torchrun` environment variables).
-  - `backend=auto` picks `nccl` on CUDA and `gloo` otherwise.
-- `capture.*`
-  - `layers`, `heads` accept Python-style integer lists; omit to capture every head.
-  - `full_attention_only=true` ignores local/sliding-window attention captures and keeps only full-attention captures.
-  - `head_sampling` picks a deterministic random set of query heads (`count`, optional `seed`) across all selected layers. Key heads are captured automatically when any sampled query head maps to them (for grouped-query attention).
-  - `sampler.type=all` captures every token (no subsampling) while still bucketing by `min_bucket_size` for reporting. To capture the first *N* tokens, set `tokenizer.max_length` to *N*.
-  - `min_bucket_size` drives bucketing (and sampling for `log_uniform`/`uniform`): `log_uniform` rounds it up to the next power of two and uses it as the minimum `2^i` bucket width (bucket IDs remain the exponent `i`, so `b{i}` → `[2^i, 2^{i+1})`). `uniform` and `all` store `floor(position / min_bucket_size)`.
-  - `capture_pre_rope` captures Q/K before rotary position embedding is applied (default captures post-RoPE).
-  - `capture_token_strings` stores an extra `token_str` column with the tokenizer string for each captured position.
-- `sampler.type` controls the bucket definition automatically: `log_uniform` samples uniformly *within* each log bucket, `uniform` samples uniformly over every fixed-width bucket, and `all` disables subsampling while still reporting uniform buckets. All are deterministic per `(example, layer, head, kind)`.
-- `output.*`
-  - `data_root` is both your working directory and (optionally) the local clone of `hf_repo_id`. Each run pulls the repo into `data_root`, records captures there immediately, and pushes it back once inference finishes.
-  - `readme_path` may be relative (inside `data_root`) or absolute. It is rewritten in place so the Hub copy stays in sync with the local metadata before uploading.
-  - Distributed mode writes rank-local shards to a temporary side directory, then rank 0 merges into `data_root` before pushing.
+Set `HF_TOKEN` in a `.env` file for Hub uploads.
 
-## Capture Output & Dataset Layout
-- Each `(model split, layer, head, vector_kind)` writes to `data/<sanitized_model>/<lXXhYY{q|k}>/data.parquet`. Splits sanitize `[\W]` → `_` (e.g., `meta/llama3-8b` → `meta_llama3_8b`).
-- `DatasetSaver` deduplicates `(example_id, position)` pairs per config by seeding an in-memory cache from existing Parquet shards, so reruns append only new tokens.
-- The saver rewrites `output.readme_path` with Hugging Face front matter listing every config plus aggregate helpers such as `all`, `layer00`, `all_q`, etc., so `datasets.load_dataset` can point at the folder or Hub repo immediately.
-- Columns:
+## Usage
 
-  | Column           | Description                                                                                                                                                                                                                                                                                                                                    |
-  |------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| | `bucket`         | Identifier of the bucket the token fell into. `log_uniform` stores the exponent `i` (clamped upward so the first bucket spans ≥ `min_bucket_size`), meaning bucket `b{i}` maps to `[2^i, 2^{i+1})`. `uniform` and `all` store `floor(position / min_bucket_size)` so every bucket covers exactly `min_bucket_size` tokens (last bucket may be smaller). |
-  | `example_id`     | Batch ID from `set_active_example_ids` (or the implicit index).                                                                                                                                                                                                                                                                                |
-  | `position`       | Token index after any cache offset.                                                                                                                                                                                                                                                                                                            |
-  | `token_str`      | Optional string representation of the token at this position (if enabled).                                                                                                                                                                                                                                                                    |
-  | `vector`         | Float32 list representing the captured query/key vector.                                                                                                                                                                                                                                                                                       |
-  | `sliding_window` | Sliding-window size for local attention layers (`null` for full causal).                                                                                                                                                                                                                                                                       |
+```bash
+sniff-qk --config configs/sample.yaml
+```
 
-Loading example:
+See [`configs/sample.yaml`](configs/sample.yaml) for a commented example. Configs in [`configs/attention-plasticity/`](configs/attention-plasticity/) are the production configs used for actual runs.
+
+## How It Works
+
+1. `patch_modeling_modules()` aliases local modeling files under `models/` into `transformers.models.*`, activating the capture hooks.
+2. The model backbone is called directly (skipping the lm_head) with `use_cache=False`. The `attention_mask` is dropped to avoid O(n^2) 4D mask expansion — causal masking with right-side padding is sufficient.
+3. Inside each attention layer, the hook calls `sniffer.capture()` with the Q/K states and position ids.
+4. The sampler selects positions on CPU (no GPU sync), gathers vectors for all active heads at once as a dense `(n_heads, K, dim)` tensor, and transfers to CPU via a single async copy.
+5. All captures accumulate in RAM. Parquet files are written only after inference completes, then optionally pushed to the Hub.
+
+## Output Format
+
+Each `(layer, head, kind)` produces `<data_root>/l{LL}h{HH}{q|k}/data.parquet`:
+
+| Column | Type | Description |
+|---|---|---|
+| `bucket` | int32 | Position bucket id (log2 exponent for `log_uniform`, `floor(pos / bucket_size)` for `uniform`/`all`) |
+| `example_id` | int32 | Dataset example index |
+| `position` | int32 | Token position in the sequence |
+| `vector` | list\<float32\> | The captured Q or K vector |
+| `sliding_window` | int32 / null | Window size for sliding-attention layers, null for full attention |
+| `token_str` | string / null | Token string (when `capture_token_strings: true`) |
+
+Each model is published to its own branch (`hf_branch`). To load:
+
 ```python
 from datasets import load_dataset
 
-queries = load_dataset("viktoroo/sniffed-qk", "l00h00q", split="meta_llama3_8b")
-layer0_all_heads = load_dataset("viktoroo/sniffed-qk", "layer00", split="meta_llama3_8b")
+ds = load_dataset(
+    "viktoroo/test-sniffer-qk",
+    "l00h00q",
+    revision="smollm2-135m-longbench-pro-128k-plus",
+)
 ```
 
-## Extending to New Models
-1. Copy the upstream `transformers` module into `models/<model_name>/modeling_<model_name>.py`.
-2. Import `compute_positions` and `get_active_sniffer` and call `sniffer.capture` inside the attention block (pass layer/head indices plus optional sliding-window size).
-3. Run `pytest tests/test_models.py -k patch_modeling_modules` (or your custom test) to ensure the aliasing still works.
-4. Include the new `model.name` in your YAML and run the CLI.
+## Project Structure
 
-## Testing & Troubleshooting
-- Run `pytest` (full suite) or scoped commands like `pytest tests/test_sniffer.py -k sampler`.
-- If `transformers.models.<name>` fails to import, ensure `pip install -e .` has been run and `patch_modeling_modules()` executes before loading the model.
-- If Hub pushes fail, verify you set `HF_TOKEN` (write access) and that `hf_repo_id` exists.
-- Raise `capture.sampler.base_rate` if captures are too sparse; decrease `min_bucket_size` (power-of-two rounded) to bias toward early tokens.
+```
+sniff.py              CLI entry point, config loading, inference loop
+sniffer/
+  core.py             Sniffer class — capture hooks, in-memory accumulation, flush
+  samplers.py         Position samplers (log_uniform, uniform, all)
+saver/
+  dataset.py          DatasetSaver — Parquet writing, metadata tracking
+  readme.py           Auto-generated HF dataset card
+models/
+  <arch>/             Modified modeling files with sniffer.capture() calls
+configs/
+  sample.yaml         Minimal example config
+  attention-plasticity/  Production configs
+```
+
+## Adding a New Model
+
+1. Copy the upstream `transformers` modeling file into `models/<arch>/modeling_<arch>.py`.
+2. In the attention forward, import `get_active_sniffer` and call `sniffer.capture(layer_idx, query_states, key_states, positions, sliding_window)`.
+3. Verify with `pytest tests/ -k patch_modeling_modules`.
+
+## Configuration Reference
+
+Most fields are self-explanatory from the [sample config](configs/sample.yaml). Non-obvious options:
+
+- **`capture.head_sampling`**: Randomly samples `count` query heads across all layers (deterministic via `seed`). Key heads are included automatically for GQA models.
+- **`capture.full_attention_only`**: When `true`, skips sliding-window attention layers entirely.
+- **`capture.sampler.type`**: `log_uniform` buckets by powers of two, `uniform` by fixed-width bins, `all` captures every position.
+- **`capture.capture_pre_rope`**: Capture Q/K before rotary embedding (default: post-RoPE).
+- **`inference.debug_logging`**: Per-batch timing breakdown of hooks, flush, and forward pass.
+- **`output.hf_branch`**: One branch per model keeps the main branch clean.
