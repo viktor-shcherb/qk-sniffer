@@ -822,6 +822,14 @@ def test_push_remote_dataset_uses_branch_revision(tmp_path, monkeypatch):
         def create_repo(self, *args, **kwargs):
             events.append(("create_repo", args, kwargs))
 
+        def list_repo_files(self, repo_id, repo_type="dataset", revision=None):
+            events.append(("list_repo_files", repo_id, repo_type, revision))
+            return []
+
+        def upload_file(self, **kwargs):
+            events.append(("upload_file", kwargs))
+            return SimpleNamespace()
+
         def create_branch(self, repo_id, repo_type="dataset", branch=None, exist_ok=False):
             events.append(("create_branch", repo_id, repo_type, branch, exist_ok))
 
@@ -839,9 +847,50 @@ def test_push_remote_dataset_uses_branch_revision(tmp_path, monkeypatch):
     sniff.push_remote_dataset(settings)
 
     assert ("create_branch", "dummy/sniffed-qk", "dataset", "meta-llama3-8b-train", True) in events
+    readme_call = next(item for item in events if item[0] == "upload_file")
+    assert readme_call[1]["path_in_repo"] == "README.md"
+    assert readme_call[1]["revision"] == "main"
     upload_call = next(item for item in events if item[0] == "upload_folder")
     assert upload_call[1]["revision"] == "meta-llama3-8b-train"
     assert upload_call[1]["delete_patterns"] == ["*", "**/*"]
+
+
+def test_push_remote_dataset_skips_main_readme_seed_when_main_has_files(tmp_path, monkeypatch):
+    data_root = tmp_path / "captures"
+    data_root.mkdir(parents=True)
+
+    events = []
+
+    class _FakeApi:
+        def repo_info(self, repo_id, repo_type="dataset", revision=None):
+            events.append(("repo_info", repo_id, repo_type, revision))
+            return SimpleNamespace(sha="deadbeef")
+
+        def list_repo_files(self, repo_id, repo_type="dataset", revision=None):
+            events.append(("list_repo_files", repo_id, repo_type, revision))
+            return ["README.md"]
+
+        def create_branch(self, repo_id, repo_type="dataset", branch=None, exist_ok=False):
+            events.append(("create_branch", repo_id, repo_type, branch, exist_ok))
+
+        def upload_file(self, **kwargs):
+            events.append(("upload_file", kwargs))
+            return SimpleNamespace()
+
+        def upload_folder(self, **kwargs):
+            events.append(("upload_folder", kwargs))
+            return SimpleNamespace()
+
+    monkeypatch.setattr(sniff, "HfApi", lambda: _FakeApi())
+
+    settings = sniff.OutputSettings(
+        data_root=str(data_root),
+        hf_repo_id="dummy/sniffed-qk",
+        hf_branch="meta-llama3-8b-train",
+    )
+    sniff.push_remote_dataset(settings)
+
+    assert not any(item[0] == "upload_file" for item in events)
 
 
 def test_pull_remote_dataset_resets_local_root(tmp_path, monkeypatch):

@@ -27,6 +27,7 @@ from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.errors import RepositoryNotFoundError, HfHubHTTPError
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from saver.readme import DatasetReadme
 from sniffer import (
     AllSampler,
     LogUniformSampler,
@@ -960,6 +961,33 @@ def pull_remote_dataset(settings: OutputSettings) -> None:
     target_root.mkdir(parents=True, exist_ok=True)
 
 
+def _ensure_main_branch_readme(api: HfApi, repo_id: str) -> None:
+    try:
+        main_files = api.list_repo_files(
+            repo_id=repo_id,
+            repo_type="dataset",
+            revision="main",
+        )
+    except HfHubHTTPError as err:
+        print(f"[sniff] Failed to inspect main branch for {repo_id}: {err}")
+        return
+    if main_files:
+        return
+    readme_text = DatasetReadme(Path("README.md"), dataset_name=repo_id).main_branch_text()
+    try:
+        api.upload_file(
+            path_or_fileobj=readme_text.encode("utf-8"),
+            path_in_repo="README.md",
+            repo_id=repo_id,
+            repo_type="dataset",
+            revision="main",
+            commit_message="Add default branch README",
+        )
+        print(f"[sniff] Added README.md to empty main branch for {repo_id}")
+    except HfHubHTTPError as err:
+        print(f"[sniff] Failed to seed main README for {repo_id}: {err}")
+
+
 def push_remote_dataset(settings: OutputSettings) -> None:
     if not settings.hf_repo_id:
         return
@@ -970,6 +998,7 @@ def push_remote_dataset(settings: OutputSettings) -> None:
     except RepositoryNotFoundError:
         print(f"[sniff] Creating dataset repo {settings.hf_repo_id}")
         api.create_repo(settings.hf_repo_id, repo_type="dataset", exist_ok=True, private=settings.private)
+    _ensure_main_branch_readme(api, settings.hf_repo_id)
     if revision:
         try:
             api.create_branch(

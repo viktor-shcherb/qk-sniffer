@@ -8,6 +8,7 @@ import pytest
 from datasets import load_dataset
 
 from saver.dataset import CaptureBatch, CaptureRow, DatasetSaver
+from saver.readme import DatasetReadme
 
 
 def test_dataset_saver_writes_parquet_and_root_readme(tmp_path):
@@ -43,6 +44,13 @@ def test_dataset_saver_writes_parquet_and_root_readme(tmp_path):
     assert "`model`: `meta/llama3-8b`" in readme
     assert "`l00h00q`" in readme
     assert "`l00h00k`" in readme
+
+
+def test_main_branch_readme_template_uses_real_newlines_and_repo_name(tmp_path):
+    text = DatasetReadme(tmp_path / "README.md", dataset_name="dummy/sniffed-qk").main_branch_text()
+    assert "\\n" not in text
+    assert "repo = \"dummy/sniffed-qk\"" in text
+    assert "This is the default branch for the sniffed-qk dataset." in text
 
 
 def test_dataset_saver_writes_token_strings(tmp_path):

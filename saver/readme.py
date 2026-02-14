@@ -25,7 +25,7 @@ class DatasetReadme:
     ) -> None:
         if model_name is None and not metadata and not config_names and not bucket_counts:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(self._main_branch_readme(), encoding="utf-8")
+            self.path.write_text(self.main_branch_text(), encoding="utf-8")
             return
 
         model_display = model_name or "unknown"
@@ -120,30 +120,30 @@ class DatasetReadme:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(text, encoding="utf-8")
 
-    def _main_branch_readme(self) -> str:
+    def main_branch_text(self) -> str:
         return (
-            "# sniffed-qk\\n\\n"
-            "This is the default branch for the sniffed-qk dataset.\\n\\n"
-            "## How Versions Are Organized\\n"
-            "- This branch intentionally stores no Parquet data files.\\n"
-            "- Each model+dataset specialization lives on a dedicated Git branch.\\n"
-            "- Pick the branch name from your run configuration (`output.hf_branch`) and load data from that branch.\\n\\n"
-            "## Branch Layout\\n"
-            "- `README.md` at the branch root\\n"
-            "- `lXXhYYq/data.parquet` (queries)\\n"
-            "- `lXXhYYk/data.parquet` (keys)\\n\\n"
-            "## Loading Example\\n"
-            "```python\\n"
-            "from datasets import load_dataset\\n\\n"
-            "repo = \"viktoroo/sniffed-qk\"\\n"
-            "branch = \"<model-specialization-branch>\"\\n"
-            "config = \"l00h00q\"\\n\\n"
-            "ds = load_dataset(\\n"
-            "    \"parquet\",\\n"
-            "    data_files=f\"hf://datasets/{repo}@{branch}/{config}/*.parquet\",\\n"
-            "    split=\"train\",\\n"
-            ")\\n"
-            "```\\n"
+            "# sniffed-qk\n\n"
+            "This is the default branch for the sniffed-qk dataset.\n\n"
+            "## How Versions Are Organized\n"
+            "- This branch intentionally stores no Parquet data files.\n"
+            "- Each model+dataset specialization lives on a dedicated Git branch.\n"
+            "- Pick the branch name from your run configuration (`output.hf_branch`) and load data from that branch.\n\n"
+            "## Branch Layout\n"
+            "- `README.md` at the branch root\n"
+            "- `lXXhYYq/data.parquet` (queries)\n"
+            "- `lXXhYYk/data.parquet` (keys)\n\n"
+            "## Loading Example\n"
+            "```python\n"
+            "from datasets import load_dataset\n\n"
+            f"repo = \"{self.dataset_name}\"\n"
+            "branch = \"<model-specialization-branch>\"\n"
+            "config = \"l00h00q\"\n\n"
+            "ds = load_dataset(\n"
+            "    \"parquet\",\n"
+            "    data_files=f\"hf://datasets/{repo}@{branch}/{config}/*.parquet\",\n"
+            "    split=\"train\",\n"
+            ")\n"
+            "```\n"
         )
 
     @staticmethod
