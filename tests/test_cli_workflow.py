@@ -256,6 +256,7 @@ def test_maybe_place_single_process_model_moves_to_mps_and_casts_dtype(monkeypat
             return self
 
     model = _TrackModel()
+    monkeypatch.setattr(sniff.torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(sniff, "_mps_is_available", lambda: True)
     placed = sniff._maybe_place_single_process_model(
         model,
@@ -268,6 +269,31 @@ def test_maybe_place_single_process_model_moves_to_mps_and_casts_dtype(monkeypat
     assert len(model.calls) == 1
     _, kwargs = model.calls[0]
     assert kwargs["device"] == torch.device("mps")
+    assert kwargs["dtype"] == torch.float16
+
+
+def test_maybe_place_single_process_model_moves_to_cuda(monkeypatch):
+    class _TrackModel:
+        def __init__(self):
+            self.calls = []
+
+        def to(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return self
+
+    model = _TrackModel()
+    monkeypatch.setattr(sniff.torch.cuda, "is_available", lambda: True)
+    placed = sniff._maybe_place_single_process_model(
+        model,
+        distributed=sniff.DistributedContext(enabled=False),
+        requested_device_map=None,
+        requested_dtype=torch.float16,
+    )
+
+    assert placed is model
+    assert len(model.calls) == 1
+    _, kwargs = model.calls[0]
+    assert kwargs["device"] == torch.device("cuda")
     assert kwargs["dtype"] == torch.float16
 
 
@@ -815,25 +841,13 @@ def test_push_remote_dataset_uses_branch_revision(tmp_path, monkeypatch):
     assert ("create_branch", "dummy/sniffed-qk", "dataset", "meta-llama3-8b-train", True) in events
     upload_call = next(item for item in events if item[0] == "upload_folder")
     assert upload_call[1]["revision"] == "meta-llama3-8b-train"
+    assert upload_call[1]["delete_patterns"] == ["*", "**/*"]
 
 
-def test_pull_remote_dataset_uses_branch_revision(tmp_path, monkeypatch):
+def test_pull_remote_dataset_resets_local_root(tmp_path, monkeypatch):
     data_root = tmp_path / "captures"
-    calls = []
-
-    class _FakeApi:
-        def repo_info(self, repo_id, repo_type="dataset", revision=None):
-            calls.append(("repo_info", repo_id, repo_type, revision))
-            return SimpleNamespace(sha="abc123")
-
-    def fake_snapshot_download(**kwargs):
-        calls.append(("snapshot_download", kwargs))
-        local_dir = Path(kwargs["local_dir"])
-        (local_dir / "README.md").write_text("stub", encoding="utf-8")
-        return str(local_dir)
-
-    monkeypatch.setattr(sniff, "HfApi", lambda: _FakeApi())
-    monkeypatch.setattr(sniff, "snapshot_download", fake_snapshot_download)
+    data_root.mkdir(parents=True)
+    (data_root / "stale.txt").write_text("stale", encoding="utf-8")
 
     settings = sniff.OutputSettings(
         data_root=str(data_root),
@@ -842,9 +856,5 @@ def test_pull_remote_dataset_uses_branch_revision(tmp_path, monkeypatch):
     )
     sniff.pull_remote_dataset(settings)
 
-    repo_info_call = next(item for item in calls if item[0] == "repo_info")
-    assert repo_info_call[3] == "meta-llama3-8b-train"
-    snapshot_call = next(item for item in calls if item[0] == "snapshot_download")
-    assert snapshot_call[1]["revision"] == "abc123"
-    state = json.loads((data_root / ".sniff_snapshot.json").read_text(encoding="utf-8"))
-    assert state["revision"] == "meta-llama3-8b-train"
+    assert data_root.exists()
+    assert not (data_root / "stale.txt").exists()

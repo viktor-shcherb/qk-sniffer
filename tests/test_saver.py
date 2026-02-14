@@ -79,7 +79,7 @@ def test_dataset_saver_rejects_multiple_models_in_one_branch(tmp_path):
     saver.close()
 
 
-def test_dataset_saver_skips_duplicates_same_session(tmp_path):
+def test_dataset_saver_keeps_duplicates_same_session(tmp_path):
     saver = DatasetSaver(root=tmp_path / "data", readme_path=tmp_path / "README.md")
     row = _row("meta/llama3-8b", layer=0, head=0, kind="q", bucket=0, example_id=0, position=0, vector=[0.1])
     saver.add(row)
@@ -88,10 +88,10 @@ def test_dataset_saver_skips_duplicates_same_session(tmp_path):
 
     parquet_path = tmp_path / "data" / "l00h00q" / "data.parquet"
     table = pq.read_table(parquet_path)
-    assert table.num_rows == 1
+    assert table.num_rows == 2
 
 
-def test_dataset_saver_skips_duplicates_across_sessions(tmp_path):
+def test_dataset_saver_overwrites_config_file_across_sessions(tmp_path):
     root = tmp_path / "data"
     readme = tmp_path / "README.md"
     row = _row("meta/llama3-8b", layer=0, head=0, kind="q", bucket=0, example_id=0, position=0, vector=[0.1])
@@ -109,7 +109,7 @@ def test_dataset_saver_skips_duplicates_across_sessions(tmp_path):
     assert table.num_rows == 1
 
 
-def test_dataset_saver_add_batch_deduplicates_and_flushes(tmp_path):
+def test_dataset_saver_add_batch_flushes_without_deduplication(tmp_path):
     saver = DatasetSaver(root=tmp_path / "data", readme_path=tmp_path / "README.md", write_batch_size=16)
     batch = CaptureBatch(
         model_name="meta/llama3-8b",
@@ -127,8 +127,8 @@ def test_dataset_saver_add_batch_deduplicates_and_flushes(tmp_path):
 
     parquet_path = tmp_path / "data" / "l00h00q" / "data.parquet"
     table = pq.read_table(parquet_path)
-    assert table.num_rows == 2
-    assert table.column("sliding_window").to_pylist() == [64, 64]
+    assert table.num_rows == 3
+    assert table.column("sliding_window").to_pylist() == [64, 64, 64]
 
 
 def test_dataset_saver_includes_model_stats_in_readme(tmp_path):

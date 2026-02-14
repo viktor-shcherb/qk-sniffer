@@ -10,7 +10,7 @@ model:
   name: HuggingFaceTB/SmolLM2-135M
   revision: main
   dtype: float16
-  device_map: null
+  device_map: auto
   trust_remote_code: false
 
 tokenizer:
@@ -25,7 +25,6 @@ inference:
   autocast_dtype: float16
   distributed: false
   backend: auto
-  debug_logging: true
 
 capture:
   capture_queries: true

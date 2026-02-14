@@ -5,7 +5,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Literal, Optional, Sequence, Set, Tuple, Union
+from typing import Dict, Iterable, List, Literal, Optional, Sequence, Set, Union
 
 try:
     import numpy as np
@@ -131,7 +131,6 @@ class DatasetSaver:
 
         self._sinks: Dict[str, _ParquetSink] = {}
         self._config_names: Set[str] = set()
-        self._position_cache: Dict[str, Set[Tuple[int, int]]] = {}
         self._bucket_counts: Counter = Counter()
 
         self._model_name: Optional[str] = None
@@ -191,23 +190,12 @@ class DatasetSaver:
         config = batch.config_name
         self._config_names.add(config)
         key = config
-        position_cache = self._position_cache.setdefault(key, self._load_existing_positions(config))
 
-        keep_mask = np.ones(row_count, dtype=bool)
-        for idx in range(row_count):
-            position_key = (int(example_ids[idx]), int(positions[idx]))
-            if position_key in position_cache:
-                keep_mask[idx] = False
-            else:
-                position_cache.add(position_key)
-
-        if not keep_mask.any():
-            return
-
-        buckets = buckets[keep_mask].astype("int32", copy=False)
-        example_ids = example_ids[keep_mask].astype("int32", copy=False)
-        positions = positions[keep_mask].astype("int32", copy=False)
-        vectors = vectors[keep_mask].astype("float32", copy=False)
+        keep_mask = None
+        buckets = buckets.astype("int32", copy=False)
+        example_ids = example_ids.astype("int32", copy=False)
+        positions = positions.astype("int32", copy=False)
+        vectors = vectors.astype("float32", copy=False)
         sliding_window_values: List = (
             [int(batch.sliding_window)] * buckets.shape[0]
             if batch.sliding_window is not None
@@ -225,7 +213,7 @@ class DatasetSaver:
         elif not token_policy and has_tokens:
             raise ValueError(f"Token strings provided for {key} after writing data without token strings.")
         if has_tokens and token_strings is None:
-            token_strings = np.asarray(token_strings_raw, dtype=object)[keep_mask].tolist()
+            token_strings = np.asarray(token_strings_raw, dtype=object).tolist()
 
         columns = {
             "bucket": buckets.tolist(),
@@ -339,21 +327,6 @@ class DatasetSaver:
 
     def _create_sink(self, config: str) -> _ParquetSink:
         return _ParquetSink(self.root, config, compression=self.compression)
-
-    def _load_existing_positions(self, config: str) -> Set[Tuple[int, int]]:
-        cache: Set[Tuple[int, int]] = set()
-        data_path = self.root / config / "data.parquet"
-        if not data_path.exists():
-            return cache
-        try:
-            table = pq.read_table(data_path, columns=["example_id", "position"])
-        except Exception:
-            return cache
-        example_ids = table.column("example_id").to_pylist()
-        positions = table.column("position").to_pylist()
-        for example_id, position in zip(example_ids, positions):
-            cache.add((int(example_id), int(position)))
-        return cache
 
     def _load_state(self) -> None:
         if not self._state_path.exists():

@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 import hashlib
 import re
 import shutil
-import tempfile
 from pathlib import Path
 from time import perf_counter
 from types import ModuleType
@@ -23,7 +22,7 @@ from tqdm.auto import tqdm
 import torch
 import yaml
 from datasets import Dataset, IterableDataset, load_dataset
-from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.errors import RepositoryNotFoundError, HfHubHTTPError
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -139,7 +138,6 @@ DTYPE_ALIASES = {
 }
 
 _CONFIG_NAME_RE = re.compile(r"^l(\d{2})h(\d{2})([qk])$")
-_SNAPSHOT_STATE_FILENAME = ".sniff_snapshot.json"
 
 
 def _debug_log(enabled: bool, message: str) -> None:
@@ -558,9 +556,12 @@ def _maybe_place_single_process_model(
         return model
     if requested_device_map is not None:
         return model
-    if not _mps_is_available():
-        return model
     if not hasattr(model, "to"):
+        return model
+
+    if torch.cuda.is_available():
+        return model.to(device=torch.device("cuda"), dtype=requested_dtype)
+    if not _mps_is_available():
         return model
 
     target_dtype = requested_dtype
@@ -950,110 +951,11 @@ def patch_modeling_modules(root: Path = Path("models")) -> None:
             pass
 
 
-def _snapshot_state_path(data_root: Path) -> Path:
-    return Path(data_root) / _SNAPSHOT_STATE_FILENAME
-
-
-def _load_snapshot_state(data_root: Path) -> Optional[Dict[str, Any]]:
-    path = _snapshot_state_path(data_root)
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-
-def _write_snapshot_state(
-    data_root: Path,
-    repo_id: str,
-    sha: Optional[str],
-    revision: Optional[str],
-) -> None:
-    path = _snapshot_state_path(data_root)
-    if not sha:
-        if path.exists():
-            try:
-                path.unlink()
-            except OSError:
-                pass
-        return
-    payload = {"repo_id": repo_id, "sha": sha, "revision": revision or ""}
-    try:
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-
 def pull_remote_dataset(settings: OutputSettings) -> None:
-    if not settings.hf_repo_id:
-        return
     target_root = Path(settings.data_root)
-    api = HfApi()
-    repo_sha: Optional[str] = None
-    revision = settings.hf_branch or None
-    try:
-        repo_info = api.repo_info(settings.hf_repo_id, repo_type="dataset", revision=revision)
-        repo_sha = getattr(repo_info, "sha", None)
-    except RepositoryNotFoundError:
-        print(f"[sniff] Dataset repo {settings.hf_repo_id} not found; skipping pull.")
-        _write_snapshot_state(target_root, settings.hf_repo_id, None, revision)
-        return
-    except HfHubHTTPError as err:
-        if revision:
-            print(
-                f"[sniff] Failed to query dataset repo {settings.hf_repo_id} at branch "
-                f"{revision}; starting from an empty local dataset root ({err})."
-            )
-            if target_root.exists():
-                shutil.rmtree(target_root)
-            target_root.mkdir(parents=True, exist_ok=True)
-            return
-        print(f"[sniff] Failed to query dataset repo {settings.hf_repo_id}: {err}")
-        return
-    state = _load_snapshot_state(target_root)
-    if (
-        repo_sha
-        and state
-        and state.get("repo_id") == settings.hf_repo_id
-        and state.get("sha") == repo_sha
-        and (state.get("revision") or "") == (revision or "")
-        and target_root.exists()
-    ):
-        if revision:
-            print(
-                f"[sniff] Dataset {settings.hf_repo_id}@{revision} already synced at {repo_sha}; "
-                "skipping pull."
-            )
-        else:
-            print(f"[sniff] Dataset {settings.hf_repo_id} already synced at {repo_sha}; skipping pull.")
-        return
-    tmp_dir = Path(tempfile.mkdtemp(prefix="sniff-pull-"))
-    try:
-        snapshot_download(
-            repo_id=settings.hf_repo_id,
-            repo_type="dataset",
-            local_dir=str(tmp_dir),
-            force_download=True,
-            token=True,
-            revision=repo_sha,
-        )
-        repo_root = tmp_dir
-        children = list(tmp_dir.iterdir())
-        if len(children) == 1 and children[0].is_dir():
-            repo_root = children[0]
-        if target_root.exists():
-            shutil.rmtree(target_root)
-        shutil.move(str(repo_root), str(target_root))
-        if repo_sha:
-            _write_snapshot_state(target_root, settings.hf_repo_id, repo_sha, revision)
-    except RepositoryNotFoundError:
-        print(f"[sniff] Dataset repo {settings.hf_repo_id} not found; skipping pull.")
-        _write_snapshot_state(target_root, settings.hf_repo_id, None, revision)
-    except HfHubHTTPError as err:
-        print(f"[sniff] Failed to pull dataset repo {settings.hf_repo_id}: {err}")
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    if target_root.exists():
+        shutil.rmtree(target_root)
+    target_root.mkdir(parents=True, exist_ok=True)
 
 
 def push_remote_dataset(settings: OutputSettings) -> None:
@@ -1078,20 +980,17 @@ def push_remote_dataset(settings: OutputSettings) -> None:
             print(f"[sniff] Failed to create/use branch {revision} for {settings.hf_repo_id}: {err}")
             return
     try:
+        upload_kwargs: Dict[str, Any] = {
+            "repo_id": settings.hf_repo_id,
+            "folder_path": settings.data_root,
+            "repo_type": "dataset",
+            "commit_message": "Update dataset",
+            "revision": revision,
+            "delete_patterns": ["*", "**/*"],
+        }
         api.upload_folder(
-            repo_id=settings.hf_repo_id,
-            folder_path=settings.data_root,
-            repo_type="dataset",
-            commit_message="Update dataset",
-            revision=revision,
+            **upload_kwargs,
         )
-        try:
-            repo_info = api.repo_info(settings.hf_repo_id, repo_type="dataset", revision=revision)
-            sha = getattr(repo_info, "sha", None)
-            if sha:
-                _write_snapshot_state(Path(settings.data_root), settings.hf_repo_id, sha, revision)
-        except HfHubHTTPError:
-            pass
     except RepositoryNotFoundError:
         print(f"[sniff] Dataset repo {settings.hf_repo_id} not found; please create it before pushing.")
     except HfHubHTTPError as err:
